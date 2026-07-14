@@ -6,6 +6,7 @@ package io.github.rhusar.securenio.channels;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -472,6 +473,133 @@ public class TLSLoopbackTestCase {
                 Thread.yield();
             }
             assertTrue("Server never observed a clean end-of-stream after a graceful close", cleanEof);
+
+            serverChannel.close();
+            clientSelector.close();
+            serverSelector.close();
+            secureServerChannel.close();
+        }
+    }
+
+    /**
+     * When end-of-stream is reached in the same {@code read()} that also delivers buffered plaintext,
+     * the byte count must be reported first and the {@code -1} deferred to the next read. Before the fix,
+     * {@code decrypt()} returned the last {@code performDecryption} result (-1 on EOF) even after copying
+     * bytes into the caller's buffer, so a caller obeying the {@link java.nio.channels.ReadableByteChannel}
+     * contract would discard the tail of the stream — silent data loss.
+     */
+    @Test
+    public void noDataLossWhenEofCoincidesWithBufferedPlaintext() throws Exception {
+        // Payload larger than the tiny server read buffer, so decrypted plaintext must be drained across
+        // several reads and residual is guaranteed to still be pending when end-of-stream arrives.
+        byte[] payload = new byte[200];
+        for (int i = 0; i < payload.length; i++) {
+            payload[i] = (byte) (i % 127);
+        }
+
+        DelegatingSelectorProvider selectorProvider = new DelegatingSelectorProvider();
+
+        try (ServerSocketChannel rawServerChannel = ServerSocketChannel.open();
+             Selector acceptSelector = selectorProvider.openSelector()) {
+
+            SecureServerSocketChannel secureServerChannel = new SecureServerSocketChannel(rawServerChannel, sslContext, taskExecutor);
+            secureServerChannel.configureBlocking(false);
+            secureServerChannel.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+
+            InetSocketAddress serverAddress = (InetSocketAddress) secureServerChannel.getLocalAddress();
+            secureServerChannel.register(acceptSelector, SelectionKey.OP_ACCEPT);
+
+            SocketChannel rawClientChannel = SocketChannel.open();
+            SSLEngine clientEngine = sslContext.createSSLEngine();
+            clientEngine.setUseClientMode(true);
+            SecureSocketChannel clientChannel = new SecureSocketChannel(rawClientChannel, clientEngine, taskExecutor);
+            clientChannel.configureBlocking(false);
+            clientChannel.connect(serverAddress);
+
+            Selector clientSelector = selectorProvider.openSelector();
+            clientChannel.register(clientSelector, SelectionKey.OP_CONNECT);
+            finishConnect(clientChannel, clientSelector);
+
+            acceptSelector.select(HANDSHAKE_TIMEOUT_MS);
+            acceptSelector.selectedKeys().clear();
+            SocketChannel serverChannel = secureServerChannel.accept();
+            assertTrue(serverChannel instanceof SecureSocketChannel);
+            serverChannel.configureBlocking(false);
+
+            Selector serverSelector = selectorProvider.openSelector();
+            ((SecureSocketChannel) serverChannel).delegate().register(serverSelector, SelectionKey.OP_READ);
+            clientChannel.delegate().register(clientSelector, SelectionKey.OP_READ | SelectionKey.OP_WRITE);
+
+            // Drive a small data exchange to guarantee the TLS handshake has completed.
+            byte[] ping = "ping".getBytes();
+            ByteBuffer pingWriteBuf = ByteBuffer.wrap(ping);
+            ByteBuffer pingReadBuf = ByteBuffer.allocate(ping.length);
+            long deadline = System.currentTimeMillis() + HANDSHAKE_TIMEOUT_MS;
+            while (pingReadBuf.hasRemaining() && System.currentTimeMillis() < deadline) {
+                clientSelector.selectNow();
+                clientSelector.selectedKeys().clear();
+                if (pingWriteBuf.hasRemaining()) {
+                    clientChannel.write(pingWriteBuf);
+                }
+                serverSelector.selectNow();
+                serverSelector.selectedKeys().clear();
+                serverChannel.read(pingReadBuf);
+                Thread.yield();
+            }
+            assertFalse("handshake did not complete", pingReadBuf.hasRemaining());
+
+            // Write the whole payload, then gracefully close so the client emits data + close_notify + FIN.
+            ByteBuffer writeBuf = ByteBuffer.wrap(payload);
+            deadline = System.currentTimeMillis() + HANDSHAKE_TIMEOUT_MS;
+            while (writeBuf.hasRemaining() && System.currentTimeMillis() < deadline) {
+                clientSelector.selectNow();
+                clientSelector.selectedKeys().clear();
+                clientChannel.write(writeBuf);
+                Thread.yield();
+            }
+            assertFalse("client failed to write the full payload", writeBuf.hasRemaining());
+            clientChannel.close();
+
+            // Wait until the server socket is readable, then let the whole stream (data + close_notify +
+            // FIN) settle into the OS buffer, so the first decrypt fills the scratchpad and the trailing
+            // residual is still pending when the engine observes end-of-stream.
+            boolean readable = false;
+            deadline = System.currentTimeMillis() + HANDSHAKE_TIMEOUT_MS;
+            while (!readable && System.currentTimeMillis() < deadline) {
+                serverSelector.selectNow();
+                readable = !serverSelector.selectedKeys().isEmpty();
+                serverSelector.selectedKeys().clear();
+                Thread.yield();
+            }
+            assertTrue("payload never arrived at the server", readable);
+            Thread.sleep(50);
+
+            // Drain with a tiny buffer. All decrypted bytes must be delivered before the -1; none dropped.
+            ByteBuffer smallReadBuf = ByteBuffer.allocate(8);
+            ByteBuffer accumulated = ByteBuffer.allocate(payload.length);
+            deadline = System.currentTimeMillis() + HANDSHAKE_TIMEOUT_MS;
+            boolean sawEof = false;
+            while (System.currentTimeMillis() < deadline) {
+                serverSelector.selectNow();
+                serverSelector.selectedKeys().clear();
+                smallReadBuf.clear();
+                int read = serverChannel.read(smallReadBuf);
+                if (read < 0) {
+                    sawEof = true;
+                    break;
+                }
+                if (read > 0) {
+                    smallReadBuf.flip();
+                    accumulated.put(smallReadBuf);
+                }
+                Thread.yield();
+            }
+            assertTrue("server never observed end-of-stream", sawEof);
+
+            accumulated.flip();
+            byte[] received = new byte[accumulated.remaining()];
+            accumulated.get(received);
+            assertArrayEquals("plaintext was truncated when EOF coincided with buffered data", payload, received);
 
             serverChannel.close();
             clientSelector.close();

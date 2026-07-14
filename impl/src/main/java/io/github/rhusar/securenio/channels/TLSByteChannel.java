@@ -60,6 +60,8 @@ final class TLSByteChannel {
      * @return total network bytes consumed, or -1 if end-of-stream
      */
     int decrypt(ByteBuffer applicationInputRegion) throws IOException {
+        int startPosition = applicationInputRegion.position();
+
         // Drain residual decrypted data from previous cycle
         transferFromScratchpad(applicationInputRegion);
 
@@ -73,6 +75,14 @@ final class TLSByteChannel {
 
         // Transfer newly decrypted data to the caller's buffer
         transferFromScratchpad(applicationInputRegion);
+
+        // If end-of-stream was reached but plaintext was delivered to the caller in this call
+        // (residual from a previous cycle and/or freshly decrypted bytes), report that byte count
+        // now and defer the -1 to the next read. Returning -1 here would make the caller discard
+        // the bytes already placed in their buffer, violating the ReadableByteChannel contract.
+        if (decrypted < 0 && applicationInputRegion.position() > startPosition) {
+            return applicationInputRegion.position() - startPosition;
+        }
 
         return decrypted;
     }
