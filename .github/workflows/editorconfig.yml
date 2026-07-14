@@ -6,13 +6,17 @@ on:
   pull_request:
     branches:
       - '*'
+
+permissions:
+  contents: read
+
 jobs:
   editorconfig-checker:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Setup EditorConfig Checker
-        uses: editorconfig-checker/action-editorconfig-checker@v2
+        uses: editorconfig-checker/action-editorconfig-checker@d2ed4fd072ae6f887e9407c909af0f585d2ad9f4 # v2
       - name: Run EditorConfig Checker
         run: editorconfig-checker
