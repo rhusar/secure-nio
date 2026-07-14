@@ -1,0 +1,56 @@
+name: Maven
+
+on:
+  push:
+    branches:
+      - '*'
+  pull_request:
+    branches:
+      - '*'
+  merge_group:
+    types:
+      - checks_requested
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      matrix:
+        os:
+          - macos-latest
+          - ubuntu-latest
+          - windows-latest
+        # Keep this list as: all supported LTS JDKs (>= 17, the project's minimum) and the latest GA JDK.
+        # Reference: https://adoptium.net/support/
+        java:
+          - 17
+          - 21
+          - 25
+          - 26
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up JDK ${{ matrix.java }}
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+          cache: maven
+
+      - name: Build and Test with Maven
+        run: mvn --batch-mode --no-transfer-progress verify
+
+      - name: Upload Test Reports
+        uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: ${{ matrix.os }}-${{ matrix.java }}-test-reports
+          path: |
+            **/surefire-reports/*
+            **/failsafe-reports/*
