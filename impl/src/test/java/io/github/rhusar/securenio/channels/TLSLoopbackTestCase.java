@@ -6,6 +6,7 @@ package io.github.rhusar.securenio.channels;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import java.io.InputStream;
 import java.net.InetAddress;
@@ -22,6 +23,7 @@ import java.util.concurrent.Executors;
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLException;
 import javax.net.ssl.TrustManagerFactory;
 
 import io.github.rhusar.securenio.channels.spi.DelegatingSelectorProvider;
@@ -180,6 +182,97 @@ public class TLSLoopbackTestCase {
             byte[] clientReceived = new byte[clientReadBuf.remaining()];
             clientReadBuf.get(clientReceived);
             assertArrayEquals(serverPayload, clientReceived);
+
+            serverChannel.close();
+            clientChannel.close();
+            clientSelector.close();
+            serverSelector.close();
+            secureServerChannel.close();
+        }
+    }
+
+    /**
+     * A peer that hits raw end-of-stream (TCP FIN/RST) without first sending a TLS
+     * {@code close_notify} alert must be reported as an error, not a clean end-of-stream.
+     * Otherwise an active attacker can silently truncate the tail of a message.
+     */
+    @Test
+    public void truncationAttackDetectedOnEof() throws Exception {
+        DelegatingSelectorProvider selectorProvider = new DelegatingSelectorProvider();
+
+        try (ServerSocketChannel rawServerChannel = ServerSocketChannel.open();
+             Selector acceptSelector = selectorProvider.openSelector()) {
+
+            SecureServerSocketChannel secureServerChannel = new SecureServerSocketChannel(rawServerChannel, sslContext, taskExecutor);
+            secureServerChannel.configureBlocking(false);
+            secureServerChannel.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+
+            InetSocketAddress serverAddress = (InetSocketAddress) secureServerChannel.getLocalAddress();
+            secureServerChannel.register(acceptSelector, SelectionKey.OP_ACCEPT);
+
+            SocketChannel rawClientChannel = SocketChannel.open();
+            SSLEngine clientEngine = sslContext.createSSLEngine();
+            clientEngine.setUseClientMode(true);
+            SecureSocketChannel clientChannel = new SecureSocketChannel(rawClientChannel, clientEngine, taskExecutor);
+            clientChannel.configureBlocking(false);
+            clientChannel.connect(serverAddress);
+
+            Selector clientSelector = selectorProvider.openSelector();
+            clientChannel.register(clientSelector, SelectionKey.OP_CONNECT);
+            finishConnect(clientChannel, clientSelector);
+
+            acceptSelector.select(HANDSHAKE_TIMEOUT_MS);
+            acceptSelector.selectedKeys().clear();
+            SocketChannel serverChannel = secureServerChannel.accept();
+            assertTrue(serverChannel instanceof SecureSocketChannel);
+            serverChannel.configureBlocking(false);
+
+            Selector serverSelector = selectorProvider.openSelector();
+            ((SecureSocketChannel) serverChannel).delegate().register(serverSelector, SelectionKey.OP_READ);
+            clientChannel.delegate().register(clientSelector, SelectionKey.OP_READ | SelectionKey.OP_WRITE);
+
+            // Drive a small data exchange to guarantee the TLS handshake has completed.
+            byte[] payload = "ping".getBytes();
+            ByteBuffer writeBuf = ByteBuffer.wrap(payload);
+            ByteBuffer readBuf = ByteBuffer.allocate(payload.length);
+            long deadline = System.currentTimeMillis() + HANDSHAKE_TIMEOUT_MS;
+            while (readBuf.hasRemaining() && System.currentTimeMillis() < deadline) {
+                clientSelector.selectNow();
+                clientSelector.selectedKeys().clear();
+                if (writeBuf.hasRemaining()) {
+                    clientChannel.write(writeBuf);
+                }
+                serverSelector.selectNow();
+                serverSelector.selectedKeys().clear();
+                serverChannel.read(readBuf);
+                Thread.yield();
+            }
+            readBuf.flip();
+            byte[] received = new byte[readBuf.remaining()];
+            readBuf.get(received);
+            assertArrayEquals(payload, received);
+
+            // Simulate the attack: tear down the raw TCP socket beneath the client, emitting a
+            // FIN with no preceding TLS close_notify. The server's next read must NOT report a
+            // clean end-of-stream.
+            rawClientChannel.close();
+
+            ByteBuffer afterTruncation = ByteBuffer.allocate(16);
+            deadline = System.currentTimeMillis() + HANDSHAKE_TIMEOUT_MS;
+            try {
+                while (System.currentTimeMillis() < deadline) {
+                    serverSelector.selectNow();
+                    serverSelector.selectedKeys().clear();
+                    int read = serverChannel.read(afterTruncation);
+                    if (read < 0) {
+                        fail("Server read returned a clean EOF (-1); truncation was not detected");
+                    }
+                    Thread.yield();
+                }
+                fail("Server read did not surface a truncation error within the timeout");
+            } catch (SSLException expected) {
+                // Truncation correctly surfaced as a TLS error.
+            }
 
             serverChannel.close();
             clientChannel.close();

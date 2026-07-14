@@ -133,6 +133,14 @@ final class TLSByteChannel {
                 int bytesFromNetwork = rawChannel.read(networkInboundStore);
                 if (bytesFromNetwork <= 0) {
                     if (bytesFromNetwork < 0 && sessionBytesRead == 0 && totalReadFromNetwork == 0) {
+                        // End-of-stream on the raw channel. Per the TLS spec (RFC 5246 §7.2.1,
+                        // RFC 8446 §6.1), an EOF that arrives before the peer's close_notify alert
+                        // must be treated as an error rather than a clean end-of-stream: an active
+                        // attacker who cannot decrypt the traffic can still inject a TCP FIN/RST to
+                        // silently truncate the tail of a message. closeInbound() raises an
+                        // SSLException in exactly that case; if close_notify was already received it
+                        // is a harmless no-op and we report the clean end-of-stream.
+                        engine.closeInbound();
                         return bytesFromNetwork;
                     }
                     break;
