@@ -2,7 +2,7 @@
  * Copyright Radoslav Husar and contributors
  * SPDX-License-Identifier: Apache-2.0
  */
-package io.github.rhusar.securenio;
+package io.github.rhusar.securenio.channels;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;

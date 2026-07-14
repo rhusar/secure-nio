@@ -2,7 +2,7 @@
  * Copyright Radoslav Husar and contributors
  * SPDX-License-Identifier: Apache-2.0
  */
-package io.github.rhusar.securenio;
+package io.github.rhusar.securenio.channels.spi;
 
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
@@ -13,10 +13,11 @@ import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.util.concurrent.Executors;
-
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
 
+import io.github.rhusar.securenio.channels.SecureServerSocketChannel;
+import io.github.rhusar.securenio.channels.SecureSocketChannel;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;

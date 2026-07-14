@@ -2,7 +2,7 @@
  * Copyright Radoslav Husar and contributors
  * SPDX-License-Identifier: Apache-2.0
  */
-package io.github.rhusar.securenio;
+package io.github.rhusar.securenio.channels;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertTrue;
@@ -19,12 +19,12 @@ import java.security.KeyStore;
 import java.util.Iterator;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.TrustManagerFactory;
 
+import io.github.rhusar.securenio.channels.spi.DelegatingSelectorProvider;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;

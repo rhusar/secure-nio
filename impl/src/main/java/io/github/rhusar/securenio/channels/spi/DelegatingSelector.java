@@ -2,7 +2,7 @@
  * Copyright Radoslav Husar and contributors
  * SPDX-License-Identifier: Apache-2.0
  */
-package io.github.rhusar.securenio;
+package io.github.rhusar.securenio.channels.spi;
 
 import java.io.IOException;
 import java.nio.channels.ClosedChannelException;
@@ -14,6 +14,9 @@ import java.nio.channels.spi.AbstractSelector;
 import java.nio.channels.spi.SelectorProvider;
 import java.util.Set;
 import java.util.function.Consumer;
+
+import io.github.rhusar.securenio.channels.SecureServerSocketChannel;
+import io.github.rhusar.securenio.channels.SecureSocketChannel;
 
 /**
  * A {@link Selector} that delegates all operations to a real system selector, but intercepts
