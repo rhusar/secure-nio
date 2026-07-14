@@ -24,6 +24,9 @@ import javax.net.ssl.SSLSession;
  */
 final class TLSByteChannel {
 
+    /** Empty source buffer used when wrapping the {@code close_notify} alert, which carries no payload. */
+    private static final ByteBuffer EMPTY = ByteBuffer.allocate(0);
+
     private final SocketChannel rawChannel;
     private final SSLEngine engine;
     private final ExecutorService taskExecutor;
@@ -105,6 +108,40 @@ final class TLSByteChannel {
     void flushOutbound() throws IOException {
         if (networkOutboundStore.hasRemaining()) {
             transmitToNetwork(networkOutboundStore);
+        }
+    }
+
+    /**
+     * Initiates an orderly TLS shutdown by transmitting a {@code close_notify} alert to the peer.
+     * <p>
+     * Per the TLS spec (RFC 5246 §7.2.1, RFC 8446 §6.1) a peer must announce its intent to close
+     * with a {@code close_notify} alert; otherwise the connection looks like a truncation attack to
+     * a compliant peer. {@link SSLEngine#closeOutbound()} queues that alert, which this method then
+     * wraps and flushes to the network. The raw socket must remain open until the alert has been
+     * transmitted, so this must be called <em>before</em> closing the underlying channel.
+     */
+    void closeOutbound() throws IOException {
+        engine.closeOutbound();
+
+        // Drain the close_notify alert queued by closeOutbound() to the network. wrap() emits it and
+        // reports CLOSED; on a non-blocking channel that cannot accept it all right now this is
+        // best-effort, since we must not block the close path indefinitely.
+        while (!engine.isOutboundDone()) {
+            networkOutboundStore.compact();
+            SSLEngineResult result = engine.wrap(EMPTY, networkOutboundStore);
+            networkOutboundStore.flip();
+
+            if (networkOutboundStore.hasRemaining()) {
+                int written = transmitToNetwork(networkOutboundStore);
+                if (written < 0 || networkOutboundStore.hasRemaining()) {
+                    // Peer gone or socket cannot drain further without blocking.
+                    break;
+                }
+            }
+
+            if (result.getStatus() == SSLEngineResult.Status.CLOSED) {
+                break;
+            }
         }
     }
 

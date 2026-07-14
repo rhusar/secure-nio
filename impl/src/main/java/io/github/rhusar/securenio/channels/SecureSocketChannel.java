@@ -132,11 +132,14 @@ public class SecureSocketChannel extends SocketChannel {
     @Override
     protected void implCloseSelectableChannel() throws IOException {
         try {
-            tlsChannel.flushOutbound();
+            // Announce closure with a close_notify alert while the raw socket is still open, so a
+            // compliant peer does not mistake our shutdown for a truncation attack.
+            tlsChannel.closeOutbound();
         } catch (Exception ignored) {
+        } finally {
+            delegate.close();
+            tlsChannel.shutdown();
         }
-        delegate.close();
-        tlsChannel.shutdown();
     }
 
     @Override

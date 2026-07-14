@@ -392,6 +392,94 @@ public class TLSLoopbackTestCase {
         }
     }
 
+    /**
+     * A graceful {@link SecureSocketChannel#close()} must transmit a TLS {@code close_notify} alert
+     * before tearing down the raw socket. The peer must then observe a clean end-of-stream ({@code -1})
+     * rather than a truncation {@link SSLException} — otherwise our own orderly close is indistinguishable
+     * from an attack, and (once truncation detection is in place) unusable against a compliant peer.
+     */
+    @Test
+    public void gracefulCloseSendsCloseNotify() throws Exception {
+        DelegatingSelectorProvider selectorProvider = new DelegatingSelectorProvider();
+
+        try (ServerSocketChannel rawServerChannel = ServerSocketChannel.open();
+             Selector acceptSelector = selectorProvider.openSelector()) {
+
+            SecureServerSocketChannel secureServerChannel = new SecureServerSocketChannel(rawServerChannel, sslContext, taskExecutor);
+            secureServerChannel.configureBlocking(false);
+            secureServerChannel.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+
+            InetSocketAddress serverAddress = (InetSocketAddress) secureServerChannel.getLocalAddress();
+            secureServerChannel.register(acceptSelector, SelectionKey.OP_ACCEPT);
+
+            SocketChannel rawClientChannel = SocketChannel.open();
+            SSLEngine clientEngine = sslContext.createSSLEngine();
+            clientEngine.setUseClientMode(true);
+            SecureSocketChannel clientChannel = new SecureSocketChannel(rawClientChannel, clientEngine, taskExecutor);
+            clientChannel.configureBlocking(false);
+            clientChannel.connect(serverAddress);
+
+            Selector clientSelector = selectorProvider.openSelector();
+            clientChannel.register(clientSelector, SelectionKey.OP_CONNECT);
+            finishConnect(clientChannel, clientSelector);
+
+            acceptSelector.select(HANDSHAKE_TIMEOUT_MS);
+            acceptSelector.selectedKeys().clear();
+            SocketChannel serverChannel = secureServerChannel.accept();
+            assertTrue(serverChannel instanceof SecureSocketChannel);
+            serverChannel.configureBlocking(false);
+
+            Selector serverSelector = selectorProvider.openSelector();
+            ((SecureSocketChannel) serverChannel).delegate().register(serverSelector, SelectionKey.OP_READ);
+            clientChannel.delegate().register(clientSelector, SelectionKey.OP_READ | SelectionKey.OP_WRITE);
+
+            // Drive a small data exchange to guarantee the TLS handshake has completed.
+            byte[] payload = "ping".getBytes();
+            ByteBuffer writeBuf = ByteBuffer.wrap(payload);
+            ByteBuffer readBuf = ByteBuffer.allocate(payload.length);
+            long deadline = System.currentTimeMillis() + HANDSHAKE_TIMEOUT_MS;
+            while (readBuf.hasRemaining() && System.currentTimeMillis() < deadline) {
+                clientSelector.selectNow();
+                clientSelector.selectedKeys().clear();
+                if (writeBuf.hasRemaining()) {
+                    clientChannel.write(writeBuf);
+                }
+                serverSelector.selectNow();
+                serverSelector.selectedKeys().clear();
+                serverChannel.read(readBuf);
+                Thread.yield();
+            }
+            readBuf.flip();
+            byte[] received = new byte[readBuf.remaining()];
+            readBuf.get(received);
+            assertArrayEquals(payload, received);
+
+            // Orderly shutdown: this must emit close_notify before the FIN.
+            clientChannel.close();
+
+            // The server must observe a clean end-of-stream, not a truncation error.
+            ByteBuffer afterClose = ByteBuffer.allocate(16);
+            boolean cleanEof = false;
+            deadline = System.currentTimeMillis() + HANDSHAKE_TIMEOUT_MS;
+            while (System.currentTimeMillis() < deadline) {
+                serverSelector.selectNow();
+                serverSelector.selectedKeys().clear();
+                int read = serverChannel.read(afterClose);
+                if (read < 0) {
+                    cleanEof = true;
+                    break;
+                }
+                Thread.yield();
+            }
+            assertTrue("Server never observed a clean end-of-stream after a graceful close", cleanEof);
+
+            serverChannel.close();
+            clientSelector.close();
+            serverSelector.close();
+            secureServerChannel.close();
+        }
+    }
+
     private static void finishConnect(SecureSocketChannel channel, Selector selector) throws Exception {
         long deadline = System.currentTimeMillis() + HANDSHAKE_TIMEOUT_MS;
         while (!channel.finishConnect() && System.currentTimeMillis() < deadline) {
