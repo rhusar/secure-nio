@@ -5,6 +5,7 @@
 package io.github.rhusar.securenio.channels;
 
 import static org.junit.Assert.assertArrayEquals;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -20,6 +21,9 @@ import java.security.KeyStore;
 import java.util.Iterator;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
@@ -272,6 +276,112 @@ public class TLSLoopbackTestCase {
                 fail("Server read did not surface a truncation error within the timeout");
             } catch (SSLException expected) {
                 // Truncation correctly surfaced as a TLS error.
+            }
+
+            serverChannel.close();
+            clientChannel.close();
+            clientSelector.close();
+            serverSelector.close();
+            secureServerChannel.close();
+        }
+    }
+
+    /**
+     * A peer that sends the first few bytes of a TLS record and then goes quiet must not pin the
+     * server thread. Before the fix, {@code performDecryption} would spin forever on the resulting
+     * {@code BUFFER_UNDERFLOW} — a remotely triggerable CPU denial-of-service. The read call must
+     * instead return control to the caller so decryption can resume once more data arrives.
+     */
+    @Test
+    public void partialRecordDoesNotBusyLoop() throws Exception {
+        DelegatingSelectorProvider selectorProvider = new DelegatingSelectorProvider();
+
+        try (ServerSocketChannel rawServerChannel = ServerSocketChannel.open();
+             Selector acceptSelector = selectorProvider.openSelector()) {
+
+            SecureServerSocketChannel secureServerChannel = new SecureServerSocketChannel(rawServerChannel, sslContext, taskExecutor);
+            secureServerChannel.configureBlocking(false);
+            secureServerChannel.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+
+            InetSocketAddress serverAddress = (InetSocketAddress) secureServerChannel.getLocalAddress();
+            secureServerChannel.register(acceptSelector, SelectionKey.OP_ACCEPT);
+
+            SocketChannel rawClientChannel = SocketChannel.open();
+            SSLEngine clientEngine = sslContext.createSSLEngine();
+            clientEngine.setUseClientMode(true);
+            SecureSocketChannel clientChannel = new SecureSocketChannel(rawClientChannel, clientEngine, taskExecutor);
+            clientChannel.configureBlocking(false);
+            clientChannel.connect(serverAddress);
+
+            Selector clientSelector = selectorProvider.openSelector();
+            clientChannel.register(clientSelector, SelectionKey.OP_CONNECT);
+            finishConnect(clientChannel, clientSelector);
+
+            acceptSelector.select(HANDSHAKE_TIMEOUT_MS);
+            acceptSelector.selectedKeys().clear();
+            SocketChannel serverChannel = secureServerChannel.accept();
+            assertTrue(serverChannel instanceof SecureSocketChannel);
+            serverChannel.configureBlocking(false);
+
+            Selector serverSelector = selectorProvider.openSelector();
+            ((SecureSocketChannel) serverChannel).delegate().register(serverSelector, SelectionKey.OP_READ);
+            clientChannel.delegate().register(clientSelector, SelectionKey.OP_READ | SelectionKey.OP_WRITE);
+
+            // Drive a small data exchange to guarantee the TLS handshake has completed.
+            byte[] payload = "ping".getBytes();
+            ByteBuffer writeBuf = ByteBuffer.wrap(payload);
+            ByteBuffer readBuf = ByteBuffer.allocate(payload.length);
+            long deadline = System.currentTimeMillis() + HANDSHAKE_TIMEOUT_MS;
+            while (readBuf.hasRemaining() && System.currentTimeMillis() < deadline) {
+                clientSelector.selectNow();
+                clientSelector.selectedKeys().clear();
+                if (writeBuf.hasRemaining()) {
+                    clientChannel.write(writeBuf);
+                }
+                serverSelector.selectNow();
+                serverSelector.selectedKeys().clear();
+                serverChannel.read(readBuf);
+                Thread.yield();
+            }
+            readBuf.flip();
+            byte[] received = new byte[readBuf.remaining()];
+            readBuf.get(received);
+            assertArrayEquals(payload, received);
+
+            // Inject a partial TLS record straight onto the raw socket, bypassing the SSLEngine: the
+            // leading bytes of a record header (application_data, TLS 1.2) with no length or body.
+            // The server engine cannot complete a record from this and reports BUFFER_UNDERFLOW.
+            ByteBuffer partialRecord = ByteBuffer.wrap(new byte[]{0x17, 0x03, 0x03});
+            while (partialRecord.hasRemaining()) {
+                rawClientChannel.write(partialRecord);
+            }
+
+            // Wait until the partial bytes are readable at the server's raw channel, so the read
+            // under test is guaranteed to exercise the underflow path rather than an empty socket.
+            boolean readable = false;
+            deadline = System.currentTimeMillis() + HANDSHAKE_TIMEOUT_MS;
+            while (!readable && System.currentTimeMillis() < deadline) {
+                serverSelector.selectNow();
+                readable = !serverSelector.selectedKeys().isEmpty();
+                serverSelector.selectedKeys().clear();
+                Thread.yield();
+            }
+            assertTrue("partial record bytes never arrived at the server", readable);
+
+            // The read must return promptly. Run it on a probe thread so a regression (the infinite
+            // busy-loop) surfaces as a timeout failure instead of hanging the whole test suite.
+            ByteBuffer dst = ByteBuffer.allocate(16);
+            ExecutorService probe = Executors.newSingleThreadExecutor();
+            try {
+                Future<Integer> future = probe.submit(() -> serverChannel.read(dst));
+                int read = future.get(HANDSHAKE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                // No plaintext can be delivered from an incomplete record.
+                assertEquals(0, read);
+                assertEquals(0, dst.position());
+            } catch (TimeoutException e) {
+                fail("read() did not return on a partial TLS record — busy-loop / CPU DoS present");
+            } finally {
+                probe.shutdownNow();
             }
 
             serverChannel.close();

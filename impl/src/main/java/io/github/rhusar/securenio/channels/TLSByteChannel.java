@@ -188,6 +188,16 @@ final class TLSByteChannel {
                         }
 
                     case BUFFER_UNDERFLOW:
+                        // A partial TLS record remains in the inbound buffer and the engine needs
+                        // more bytes to decrypt it. If no new data arrived from the network this
+                        // iteration, re-looping cannot make progress and would spin the CPU at 100%.
+                        // This is remotely triggerable: a peer can send the first few bytes of a
+                        // record header, then go quiet, pinning a server thread indefinitely (DoS).
+                        // Return to the caller instead; decryption resumes once the selector signals
+                        // that more readable data has arrived.
+                        if (sessionBytesRead == 0) {
+                            return totalReadFromNetwork;
+                        }
                 }
             } finally {
                 networkInboundStore.compact();
