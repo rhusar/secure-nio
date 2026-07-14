@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ~ Copyright Radoslav Husar and contributors
+  ~ SPDX-License-Identifier: Apache-2.0
+  -->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>io.github.rhusar.securenio</groupId>
+        <artifactId>secure-nio-parent</artifactId>
+        <version>1.0.0-SNAPSHOT</version>
+    </parent>
+
+    <artifactId>secure-nio</artifactId>
+    <packaging>jar</packaging>
+
+    <name>Secure NIO</name>
+    <description>TLS wrapper implementations for the JDK NIO interfaces (SocketChannel, ServerSocketChannel, Selector)</description>
+
+    <dependencies>
+        <dependency>
+            <groupId>junit</groupId>
+            <artifactId>junit</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- Generates the self-signed keystore used by TLSLoopbackTestCase -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>keytool-maven-plugin</artifactId>
+                <version>1.5</version>
+                <dependencies>
+                    <dependency>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>keytool-api-1.7</artifactId>
+                        <version>1.5</version>
+                    </dependency>
+                </dependencies>
+                <executions>
+                    <execution>
+                        <phase>generate-test-resources</phase>
+                        <id>clean-test-keystore</id>
+                        <goals>
+                            <goal>clean</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <phase>generate-test-resources</phase>
+                        <id>genkey-test-keystore</id>
+                        <goals>
+                            <goal>generateKeyPair</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <keystore>${project.build.testOutputDirectory}/test-keystore.p12</keystore>
+                    <dname>cn=localhost</dname>
+                    <storetype>PKCS12</storetype>
+                    <storepass>changeit</storepass>
+                    <keypass>changeit</keypass>
+                    <alias>test</alias>
+                    <keyalg>RSA</keyalg>
+                    <keysize>2048</keysize>
+                    <validity>365</validity>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
