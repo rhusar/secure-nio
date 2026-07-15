@@ -1,0 +1,1 @@
+typeSearchIndex = [{"l":"All Classes and Interfaces","u":"allclasses-index.html"},{"p":"io.github.rhusar.securenio.channels.spi","l":"DelegatingSelectorProvider"},{"p":"io.github.rhusar.securenio.channels","l":"SecureServerSocketChannel"},{"p":"io.github.rhusar.securenio.channels","l":"SecureSocketChannel"}];updateSearchResults();
