@@ -15,7 +15,7 @@ import java.nio.channels.spi.SelectorProvider;
 
 /**
  * A {@link SelectorProvider} whose sole purpose is to provide a {@link DelegatingSelector}
- * capable of handling registration of TLS-wrapped channels. Channel creation is not supported.
+ * capable of handling registration of TLS/DTLS-wrapped channels. Channel creation is not supported.
  *
  * @author Radoslav Husar
  */

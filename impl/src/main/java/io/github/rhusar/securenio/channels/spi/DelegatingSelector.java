@@ -15,16 +15,18 @@ import java.nio.channels.spi.SelectorProvider;
 import java.util.Set;
 import java.util.function.Consumer;
 
+import io.github.rhusar.securenio.channels.SecureDatagramChannel;
 import io.github.rhusar.securenio.channels.SecureServerSocketChannel;
 import io.github.rhusar.securenio.channels.SecureSocketChannel;
 
 /**
  * A {@link Selector} that delegates all operations to a real system selector, but intercepts
- * channel registration to unwrap TLS-wrapped channels before registration.
+ * channel registration to unwrap TLS/DTLS-wrapped channels before registration.
  * <p>
- * When a {@link SecureSocketChannel} or {@link SecureServerSocketChannel} is registered,
- * the underlying raw channel is registered with the real selector instead. This avoids the
- * JDK-internal {@code sun.nio.ch.SelChImpl} type check in {@code SelectorImpl.register()}.
+ * When a {@link SecureSocketChannel}, {@link SecureServerSocketChannel}, or
+ * {@link SecureDatagramChannel} is registered, the underlying raw channel is registered with the
+ * real selector instead. This avoids the JDK-internal {@code sun.nio.ch.SelChImpl} type check in
+ * {@code SelectorImpl.register()}.
  *
  * @author Radoslav Husar
  */
@@ -52,6 +54,9 @@ class DelegatingSelector extends AbstractSelector {
             return secure.delegate();
         }
         if (channel instanceof SecureServerSocketChannel secure) {
+            return secure.delegate();
+        }
+        if (channel instanceof SecureDatagramChannel secure) {
             return secure.delegate();
         }
         return channel;

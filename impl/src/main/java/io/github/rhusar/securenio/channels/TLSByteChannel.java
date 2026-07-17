@@ -7,12 +7,7 @@ package io.github.rhusar.securenio.channels;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Future;
-import java.util.concurrent.RejectedExecutionException;
 
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLEngineResult;
@@ -221,7 +216,7 @@ final class TLSByteChannel {
                             case NEED_WRAP:
                                 break outer;
                             case NEED_TASK:
-                                executeDelegatedTasks();
+                                DelegatedTasks.run(engine, taskExecutor);
                                 continue;
                             case NOT_HANDSHAKING:
                             case FINISHED:
@@ -303,7 +298,7 @@ final class TLSByteChannel {
                         case NEED_UNWRAP:
                             break encryptCycle;
                         case NEED_TASK:
-                            executeDelegatedTasks();
+                            DelegatedTasks.run(engine, taskExecutor);
                             continue;
                         case NOT_HANDSHAKING:
                         case FINISHED:
@@ -339,48 +334,5 @@ final class TLSByteChannel {
             totalWritten += written;
         }
         return totalWritten;
-    }
-
-    /**
-     * Runs the engine's delegated (potentially long-running) handshake tasks to completion.
-     * <p>
-     * Tasks are offloaded to {@link #taskExecutor} and this method blocks until they finish. It must
-     * not return while a task is still pending: until every task completes the engine's handshake
-     * status stays {@code NEED_TASK}, so the wrap/unwrap loop that called this would make no progress
-     * and spin the CPU at 100%. If the executor cannot accept a task (for example it has been shut
-     * down, which otherwise surfaces as an unchecked {@link RejectedExecutionException} escaping a
-     * read or write), the task is run inline so the handshake can still complete.
-     */
-    private void executeDelegatedTasks() throws IOException {
-        Runnable task;
-        List<Future<?>> pending = null;
-        while ((task = engine.getDelegatedTask()) != null) {
-            try {
-                Future<?> future = taskExecutor.submit(task);
-                if (pending == null) {
-                    pending = new ArrayList<>();
-                }
-                pending.add(future);
-            } catch (RejectedExecutionException rejected) {
-                // Executor unavailable (e.g. shut down): run the task inline rather than letting the
-                // rejection escape or leaving the handshake permanently stuck on NEED_TASK.
-                task.run();
-            }
-        }
-
-        if (pending == null) {
-            return;
-        }
-
-        for (Future<?> future : pending) {
-            try {
-                future.get();
-            } catch (InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-                throw new IOException("Interrupted while awaiting TLS handshake task completion", interrupted);
-            } catch (ExecutionException failed) {
-                throw new IOException("TLS handshake task failed", failed.getCause());
-            }
-        }
     }
 }

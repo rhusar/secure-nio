@@ -8,6 +8,7 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
+import java.nio.channels.DatagramChannel;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
@@ -16,6 +17,7 @@ import java.util.concurrent.Executors;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
 
+import io.github.rhusar.securenio.channels.SecureDatagramChannel;
 import io.github.rhusar.securenio.channels.SecureServerSocketChannel;
 import io.github.rhusar.securenio.channels.SecureSocketChannel;
 import org.junit.After;
@@ -63,6 +65,24 @@ public class DelegatingSelectorTestCase {
             secureChannel.configureBlocking(false);
 
             SelectionKey key = secureChannel.register(selector, SelectionKey.OP_ACCEPT);
+
+            assertNotNull(key);
+            assertTrue(key.isValid());
+            assertFalse(selector.keys().isEmpty());
+        }
+    }
+
+    @Test
+    public void registerSecureDatagramChannel() throws Exception {
+        try (DatagramChannel rawChannel = DatagramChannel.open()) {
+            SSLContext sslContext = SSLContext.getInstance("DTLS");
+            sslContext.init(null, null, null);
+            SSLEngine engine = sslContext.createSSLEngine();
+            engine.setUseClientMode(true);
+            SecureDatagramChannel secureChannel = new SecureDatagramChannel(rawChannel, engine, Executors.newSingleThreadExecutor());
+            secureChannel.configureBlocking(false);
+
+            SelectionKey key = secureChannel.register(selector, SelectionKey.OP_READ);
 
             assertNotNull(key);
             assertTrue(key.isValid());
