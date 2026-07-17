@@ -7,6 +7,7 @@ package io.github.rhusar.securenio.channels;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertSame;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -16,6 +17,7 @@ import java.net.StandardSocketOptions;
 import java.nio.ByteBuffer;
 import java.nio.channels.AlreadyConnectedException;
 import java.nio.channels.DatagramChannel;
+import java.nio.channels.IllegalBlockingModeException;
 import java.nio.channels.NotYetConnectedException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -133,6 +135,27 @@ public class SecureDatagramChannelTestCase {
                 fail("send to an address other than the connected peer must throw");
             } catch (AlreadyConnectedException expected) {
             }
+        }
+    }
+
+    @Test
+    public void readRejectsBlockingMode() throws Exception {
+        try (DatagramChannel peer = DatagramChannel.open()) {
+            peer.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+            secureChannel.connect(peer.getLocalAddress());
+            // A freshly opened channel is in blocking mode, which is unsupported.
+            assertTrue(secureChannel.isBlocking());
+            assertThrows(IllegalBlockingModeException.class, () -> secureChannel.read(ByteBuffer.allocate(16)));
+        }
+    }
+
+    @Test
+    public void writeRejectsBlockingMode() throws Exception {
+        try (DatagramChannel peer = DatagramChannel.open()) {
+            peer.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+            secureChannel.connect(peer.getLocalAddress());
+            assertTrue(secureChannel.isBlocking());
+            assertThrows(IllegalBlockingModeException.class, () -> secureChannel.write(ByteBuffer.wrap("data".getBytes())));
         }
     }
 

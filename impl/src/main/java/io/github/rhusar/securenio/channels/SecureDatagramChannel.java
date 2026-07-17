@@ -13,6 +13,7 @@ import java.net.SocketOption;
 import java.nio.ByteBuffer;
 import java.nio.channels.AlreadyConnectedException;
 import java.nio.channels.DatagramChannel;
+import java.nio.channels.IllegalBlockingModeException;
 import java.nio.channels.MembershipKey;
 import java.nio.channels.NotYetConnectedException;
 import java.util.Objects;
@@ -44,6 +45,16 @@ import javax.net.ssl.SSLEngine;
  * <p>
  * Read and write operations are mutually exclusive — they share the same lock to serialize
  * concurrent access to the DTLS engine, which is not thread-safe.
+ * <p>
+ * <strong>This channel supports non-blocking mode only.</strong> The retransmission model above is
+ * inherently selector-driven: a lost handshake flight is detected because a {@code select(timeout)}
+ * expires with no progress, which is what prompts the caller to invoke {@link #retransmit()}. In
+ * blocking mode the underlying {@code read()} would instead wait forever for a datagram that was
+ * lost — the peer is meanwhile waiting for a retransmission that never comes — deadlocking the
+ * handshake on the first dropped packet (an inevitability over UDP). Both {@link #read(ByteBuffer)}
+ * and {@link #write(ByteBuffer)} therefore reject blocking mode with an
+ * {@link java.nio.channels.IllegalBlockingModeException}; call {@code configureBlocking(false)}
+ * before performing I/O.
  * <p>
  * This channel cannot be directly registered with a {@link java.nio.channels.Selector}.
  * Instead, the underlying raw channel should be registered, with this secure channel
@@ -100,9 +111,16 @@ public class SecureDatagramChannel extends DatagramChannel {
         }
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * @throws IllegalBlockingModeException if this channel is in blocking mode; only non-blocking
+     *                                      mode is supported (see the class documentation)
+     */
     @Override
     public int read(ByteBuffer dst) throws IOException {
         checkConnected();
+        requireNonBlocking();
         lock.lock();
         try {
             return dtlsChannel.decrypt(dst);
@@ -123,9 +141,16 @@ public class SecureDatagramChannel extends DatagramChannel {
         return 0;
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * @throws IllegalBlockingModeException if this channel is in blocking mode; only non-blocking
+     *                                      mode is supported (see the class documentation)
+     */
     @Override
     public int write(ByteBuffer src) throws IOException {
         checkConnected();
+        requireNonBlocking();
         lock.lock();
         try {
             return dtlsChannel.encrypt(src);
@@ -263,6 +288,18 @@ public class SecureDatagramChannel extends DatagramChannel {
     private void checkConnected() {
         if (!delegate.isConnected()) {
             throw new NotYetConnectedException();
+        }
+    }
+
+    /**
+     * Guards against blocking-mode I/O, which this channel does not support: a blocking read would
+     * wait forever for a datagram that may have been lost, with no {@code select} timeout to prompt
+     * the {@link #retransmit()} the handshake needs to recover, deadlocking on the first dropped
+     * packet.
+     */
+    private void requireNonBlocking() {
+        if (isBlocking()) {
+            throw new IllegalBlockingModeException();
         }
     }
 }

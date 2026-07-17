@@ -9,6 +9,7 @@ import java.net.Socket;
 import java.net.SocketAddress;
 import java.net.SocketOption;
 import java.nio.ByteBuffer;
+import java.nio.channels.IllegalBlockingModeException;
 import java.nio.channels.SocketChannel;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
@@ -23,6 +24,16 @@ import javax.net.ssl.SSLEngine;
  * <p>
  * Read and write operations are mutually exclusive — they share the same lock to serialize
  * concurrent access to the TLS engine, which is not thread-safe.
+ * <p>
+ * <strong>This channel supports non-blocking mode only.</strong> It is designed to be driven by a
+ * {@link java.nio.channels.Selector}: each {@link #read(ByteBuffer)} or {@link #write(ByteBuffer)}
+ * pumps the TLS engine opportunistically and hands control back so the selector can signal when the
+ * socket is next readable or writable. In blocking mode the underlying {@code read()} would wait for
+ * the peer to fill the ~16KB inbound buffer (a read of a small record would hang until far more data
+ * arrived) and the read-after-write that pumps the handshake would block indefinitely. Both
+ * {@link #read(ByteBuffer)} and {@link #write(ByteBuffer)} therefore reject blocking mode with an
+ * {@link java.nio.channels.IllegalBlockingModeException}; call {@code configureBlocking(false)}
+ * before performing I/O.
  * <p>
  * This channel cannot be directly registered with a {@link java.nio.channels.Selector}.
  * Instead, the underlying raw channel should be registered, with this secure channel
@@ -53,8 +64,26 @@ public class SecureSocketChannel extends SocketChannel {
         return delegate;
     }
 
+    /**
+     * Guards against blocking-mode I/O, which this channel does not support: a blocking read would
+     * wait for the inbound buffer to fill rather than returning after a complete record, and the
+     * read-after-write that pumps the handshake would block indefinitely.
+     */
+    private void requireNonBlocking() {
+        if (isBlocking()) {
+            throw new IllegalBlockingModeException();
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @throws IllegalBlockingModeException if this channel is in blocking mode; only non-blocking
+     *                                      mode is supported (see the class documentation)
+     */
     @Override
     public int read(ByteBuffer dst) throws IOException {
+        requireNonBlocking();
         lock.lock();
         try {
             int initialPosition = dst.position();
@@ -91,8 +120,15 @@ public class SecureSocketChannel extends SocketChannel {
         return totalRead;
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * @throws IllegalBlockingModeException if this channel is in blocking mode; only non-blocking
+     *                                      mode is supported (see the class documentation)
+     */
     @Override
     public int write(ByteBuffer src) throws IOException {
+        requireNonBlocking();
         lock.lock();
         try {
             int initialPosition = src.position();

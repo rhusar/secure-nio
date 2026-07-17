@@ -7,10 +7,14 @@ package io.github.rhusar.securenio.channels;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertSame;
+import static org.junit.Assert.assertThrows;
+import static org.junit.Assert.assertTrue;
 
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.StandardSocketOptions;
+import java.nio.ByteBuffer;
+import java.nio.channels.IllegalBlockingModeException;
 import java.nio.channels.SocketChannel;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -93,6 +97,19 @@ public class SecureSocketChannelTestCase {
         secureChannel.configureBlocking(false);
         assertFalse(rawChannel.isBlocking());
         assertFalse(secureChannel.isBlocking());
+    }
+
+    @Test
+    public void readRejectsBlockingMode() {
+        // A freshly opened channel is in blocking mode, which is unsupported.
+        assertTrue(secureChannel.isBlocking());
+        assertThrows(IllegalBlockingModeException.class, () -> secureChannel.read(ByteBuffer.allocate(16)));
+    }
+
+    @Test
+    public void writeRejectsBlockingMode() {
+        assertTrue(secureChannel.isBlocking());
+        assertThrows(IllegalBlockingModeException.class, () -> secureChannel.write(ByteBuffer.allocate(16)));
     }
 
     @Test
