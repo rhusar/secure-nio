@@ -185,6 +185,14 @@ public class SecureDatagramChannel extends DatagramChannel {
         return this.read(dst) > 0 ? delegate.getRemoteAddress() : null;
     }
 
+    /**
+     * {@inheritDoc}
+     *
+     * @throws AlreadyConnectedException if {@code target} is not the connected peer's address.
+     *         Although the name suggests a connect-time error, this is the exception type the
+     *         {@link DatagramChannel#send(ByteBuffer, SocketAddress) DatagramChannel contract}
+     *         specifies for sending to an address other than the connected one.
+     */
     @Override
     public int send(ByteBuffer src, SocketAddress target) throws IOException {
         checkConnected();
