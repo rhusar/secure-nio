@@ -223,13 +223,6 @@ final class DTLSByteChannel {
     }
 
     /**
-     * Retries transmission of a previously wrapped but unsent datagram.
-     */
-    void flushOutbound() throws IOException {
-        transmitPending();
-    }
-
-    /**
      * Initiates DTLS shutdown by transmitting a {@code close_notify} alert to the peer.
      * <p>
      * Unlike the stream variant there is no drain loop: the alert is a single datagram that may be

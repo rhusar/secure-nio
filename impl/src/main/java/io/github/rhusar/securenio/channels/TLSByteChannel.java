@@ -113,15 +113,6 @@ final class TLSByteChannel {
     }
 
     /**
-     * Flushes any buffered outbound encrypted data to the network.
-     */
-    void flushOutbound() throws IOException {
-        if (networkOutboundStore.hasRemaining()) {
-            transmitToNetwork(networkOutboundStore);
-        }
-    }
-
-    /**
      * Initiates an orderly TLS shutdown by transmitting a {@code close_notify} alert to the peer.
      * <p>
      * Per the TLS spec (RFC 5246 §7.2.1, RFC 8446 §6.1) a peer must announce its intent to close
