@@ -25,6 +25,16 @@
         </license>
     </licenses>
 
+    <issueManagement>
+        <system>GitHub Issues</system>
+        <url>https://github.com/rhusar/secure-nio/issues</url>
+    </issueManagement>
+
+    <ciManagement>
+        <system>GitHub Actions</system>
+        <url>https://github.com/rhusar/secure-nio/actions</url>
+    </ciManagement>
+
     <modules>
         <module>impl</module>
     </modules>
