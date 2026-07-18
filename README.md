@@ -147,6 +147,23 @@ The build generates a self-signed test keystore automatically for testing, so no
 
 Continuous integration runs on [GitHub Actions](https://github.com/rhusar/secure-nio/actions).
 
+### Code coverage
+
+JaCoCo coverage is enabled automatically on JDK 25 (the latest LTS) and writes an HTML report to `impl/target/site/jacoco/index.html`.
+To disable it explicitly on JDK 25:
+
+```sh
+# either deactivate the profile
+mvn clean verify -P '!jacoco'
+
+# or leave the profile active and skip the plugin
+mvn clean verify -Djacoco.skip=true
+```
+
+
+Coverage reports for `main` are published alongside the Javadoc at
+[rhusar.github.io/secure-nio/coverage/main](https://rhusar.github.io/secure-nio/coverage/main/).
+
 ## Reporting Issues
 
 Please report bugs and feature requests via [GitHub Issues](https://github.com/rhusar/secure-nio/issues).

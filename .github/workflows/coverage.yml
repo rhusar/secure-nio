@@ -1,4 +1,4 @@
-name: Javadoc
+name: Coverage
 
 on:
   push:
@@ -9,9 +9,7 @@ on:
 permissions:
   contents: write
 
-# Serialize deployments so concurrent pushes don't race on the gh-pages branch. The group is
-# shared with coverage.yml, which publishes to the same branch; cancel-in-progress must stay
-# false so the two workflows queue instead of cancelling each other mid-deploy.
+# Shared with javadoc.yml: both workflows push to gh-pages, so they must queue rather than race.
 concurrency:
   group: gh-pages-${{ github.ref }}
   cancel-in-progress: false
@@ -26,6 +24,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
+      # Must match the JDK the jacoco profile activates on; on any other JDK the profile is
+      # inactive and the build silently produces no report for the deploy step to publish.
       - name: Set up JDK 25
         uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5.5.0
         with:
@@ -33,14 +33,14 @@ jobs:
           java-version: 25
           cache: maven
 
-      - name: Generate aggregated Javadoc
-        run: mvn --batch-mode --no-transfer-progress javadoc:aggregate
+      - name: Build and Test with Maven with Coverage
+        run: mvn --batch-mode --no-transfer-progress verify
 
-      - name: Publish to gh-pages under apidocs/${{ github.ref_name }}
+      - name: Publish to gh-pages under coverage/${{ github.ref_name }}
         uses: JamesIves/github-pages-deploy-action@d92aa235d04922e8f08b40ce78cc5442fcfbfa2f # v4.8.0
         with:
           branch: gh-pages
-          folder: target/reports/apidocs
+          folder: impl/target/site/jacoco
           # Each branch/tag gets its own versioned folder; the action's clean
           # step is scoped to this target-folder, so sibling versions are kept.
-          target-folder: apidocs/${{ github.ref_name }}
+          target-folder: coverage/${{ github.ref_name }}

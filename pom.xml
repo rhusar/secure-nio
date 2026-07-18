@@ -43,6 +43,7 @@
         <maven.compiler.release>17</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
+        <version.jacoco-maven-plugin>0.8.15</version.jacoco-maven-plugin>
         <version.junit>4.13.2</version.junit>
         <version.maven-javadoc-plugin>3.11.2</version.maven-javadoc-plugin>
     </properties>
@@ -95,4 +96,44 @@ SPDX-License-Identifier: Apache-2.0</inlineHeader>
             </plugin>
         </plugins>
     </build>
+
+    <profiles>
+        <!--
+          Code coverage runs automatically on the latest LTS JDK only. JaCoCo instruments bytecode and
+          rejects class file versions it does not yet support, so restricting it to a single JDK keeps the
+          rest of the CI matrix - which includes the latest GA JDK - independent of JaCoCo's release cadence.
+          The value is a prefix match, so it activates on any 25.x but not on 26. Note that the range
+          syntax [25] would mean exactly "25" and would never match a real JDK version such as 25.0.3.
+        -->
+        <profile>
+            <id>jacoco</id>
+            <activation>
+                <jdk>25</jdk>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.jacoco</groupId>
+                        <artifactId>jacoco-maven-plugin</artifactId>
+                        <version>${version.jacoco-maven-plugin}</version>
+                        <executions>
+                            <execution>
+                                <id>prepare-agent</id>
+                                <goals>
+                                    <goal>prepare-agent</goal>
+                                </goals>
+                            </execution>
+                            <execution>
+                                <id>report</id>
+                                <phase>verify</phase>
+                                <goals>
+                                    <goal>report</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 </project>
