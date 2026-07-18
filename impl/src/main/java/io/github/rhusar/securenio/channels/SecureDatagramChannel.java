@@ -19,6 +19,7 @@ import java.nio.channels.NotYetConnectedException;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 
 import javax.net.ssl.SSLEngine;
@@ -75,6 +76,12 @@ import javax.net.ssl.SSLEngine;
  * @author Radoslav Husar
  */
 public class SecureDatagramChannel extends DatagramChannel {
+
+    /**
+     * Bounded wait to acquire {@link #lock} on close, so a wedged lock holder (e.g. a stalled
+     * delegated task) cannot block {@code close()} indefinitely.
+     */
+    private static final long CLOSE_LOCK_TIMEOUT_MILLIS = 1000;
 
     private final DatagramChannel delegate;
     private final DTLSByteChannel dtlsChannel;
@@ -248,14 +255,33 @@ public class SecureDatagramChannel extends DatagramChannel {
 
     @Override
     protected void implCloseSelectableChannel() throws IOException {
+        // The DTLS engine is not thread-safe, so driving it here must hold the same lock that
+        // serializes read() and write() – close() can run concurrently with in-flight I/O on
+        // another thread. The wait is bounded so a wedged lock holder cannot block close
+        // indefinitely; on timeout the engine is left untouched (close_notify is best-effort
+        // anyway) and only the raw socket is closed.
+        boolean locked = false;
         try {
-            // Announce closure with a best-effort close_notify alert while the raw socket is still
-            // open; the single datagram may be lost, which DTLS peers must tolerate.
-            dtlsChannel.closeOutbound();
-        } catch (Exception ignored) {
-        } finally {
+            locked = lock.tryLock(CLOSE_LOCK_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        if (!locked) {
             delegate.close();
-            dtlsChannel.shutdown();
+            return;
+        }
+        try {
+            try {
+                // Announce closure with a best-effort close_notify alert while the raw socket is still
+                // open; the single datagram may be lost, which DTLS peers must tolerate.
+                dtlsChannel.closeOutbound();
+            } catch (Exception ignored) {
+            } finally {
+                delegate.close();
+                dtlsChannel.shutdown();
+            }
+        } finally {
+            lock.unlock();
         }
     }
 

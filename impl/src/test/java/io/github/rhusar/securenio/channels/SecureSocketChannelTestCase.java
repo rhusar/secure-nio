@@ -18,6 +18,7 @@ import java.nio.channels.IllegalBlockingModeException;
 import java.nio.channels.SocketChannel;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
@@ -116,5 +117,46 @@ public class SecureSocketChannelTestCase {
     public void closeClosesDelegate() throws Exception {
         secureChannel.close();
         assertFalse(rawChannel.isOpen());
+    }
+
+    /**
+     * The TLS engine is not thread-safe, so a {@code close()} racing an in-flight {@code write()}
+     * must not drive the engine while the writer is still inside it. The writer parks inside
+     * {@code wrap()} holding the channel lock; close must give up on the engine after its bounded
+     * wait and still close the raw channel.
+     */
+    @Test
+    public void closeDoesNotDriveEngineConcurrentlyWithInFlightWrite() throws Exception {
+        SocketChannel raw = SocketChannel.open();
+        ExecutorService taskExecutor = Executors.newSingleThreadExecutor();
+        try {
+            SSLEngine realEngine = SSLContext.getDefault().createSSLEngine();
+            realEngine.setUseClientMode(true);
+            BlockingSSLEngine engine = new BlockingSSLEngine(realEngine);
+            SecureSocketChannel channel = new SecureSocketChannel(raw, engine, taskExecutor);
+            channel.configureBlocking(false);
+
+            Thread writer = new Thread(() -> {
+                try {
+                    channel.write(ByteBuffer.wrap("data".getBytes()));
+                } catch (Exception expectedOnceClosed) {
+                }
+            });
+            writer.start();
+            try {
+                assertTrue("writer never reached the engine", engine.awaitWrapEntered(5, TimeUnit.SECONDS));
+
+                channel.close();
+                assertFalse(raw.isOpen());
+            } finally {
+                engine.releaseWrap();
+                writer.join(5000);
+            }
+            assertFalse("writer thread did not finish", writer.isAlive());
+            assertFalse("engine was driven from two threads at once", engine.sawConcurrentAccess());
+        } finally {
+            taskExecutor.shutdownNow();
+            raw.close();
+        }
     }
 }
