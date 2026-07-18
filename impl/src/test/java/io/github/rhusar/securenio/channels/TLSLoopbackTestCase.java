@@ -10,6 +10,7 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
+import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -25,6 +26,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
@@ -390,6 +392,67 @@ public class TLSLoopbackTestCase {
             clientSelector.close();
             serverSelector.close();
             secureServerChannel.close();
+        }
+    }
+
+    /**
+     * A peer that streams records decrypting to zero plaintext (TLS 1.3 {@code NewSessionTicket},
+     * {@code KeyUpdate}) must not pin the reading thread. Such records never fill the caller's
+     * buffer, so before the fix the decryption loop had no bound at all – it kept consuming them
+     * for as long as the peer kept sending, never returning to the selector and starving every
+     * other connection served by that thread. {@code MAX_ENGINE_LOOPS} must cap the loop and hand
+     * control back. A stub engine that consumes ciphertext without producing plaintext stands in
+     * for that record stream, driven by a raw client that keeps the socket fed.
+     */
+    @Test
+    public void zeroPlaintextRecordStreamDoesNotPinThread() throws Exception {
+        try (ServerSocketChannel rawServerChannel = ServerSocketChannel.open();
+             SocketChannel rawClientChannel = SocketChannel.open()) {
+
+            rawServerChannel.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+            rawClientChannel.connect(rawServerChannel.getLocalAddress());
+            SocketChannel serverRawChannel = rawServerChannel.accept();
+
+            SSLEngine stubEngine = new ZeroPlaintextSSLEngine(sslContext.createSSLEngine().getSession());
+            SecureSocketChannel serverChannel = new SecureSocketChannel(serverRawChannel, stubEngine, taskExecutor);
+            serverChannel.configureBlocking(false);
+
+            // The attacking peer: a blocking writer keeps the server's receive buffer fed with raw
+            // bytes for the whole probe window, standing in for the sustained record stream.
+            AtomicBoolean stopWriter = new AtomicBoolean();
+            Thread writer = new Thread(() -> {
+                ByteBuffer junk = ByteBuffer.allocate(8192);
+                try {
+                    while (!stopWriter.get()) {
+                        junk.clear();
+                        rawClientChannel.write(junk);
+                    }
+                } catch (IOException ignored) {
+                    // The client channel is closed at the end of the test.
+                }
+            });
+            writer.start();
+
+            // The read must return even though data keeps arriving and no plaintext is ever
+            // produced. Run it on a probe thread so a regression surfaces as a timeout failure
+            // instead of hanging the whole test suite.
+            ByteBuffer dst = ByteBuffer.allocate(1024);
+            ExecutorService probe = Executors.newSingleThreadExecutor();
+            try {
+                Future<Integer> future = probe.submit(() -> serverChannel.read(dst));
+                int read = future.get(HANDSHAKE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                assertEquals(0, read);
+                assertEquals(0, dst.position());
+            } catch (TimeoutException e) {
+                fail("read() did not return while the peer streamed zero-plaintext records – engine loop unbounded, thread pinned");
+            } finally {
+                stopWriter.set(true);
+                rawClientChannel.close();
+                probe.shutdownNow();
+                writer.join(HANDSHAKE_TIMEOUT_MS);
+            }
+
+            serverChannel.close();
         }
     }
 
