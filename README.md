@@ -16,7 +16,7 @@ The library has no runtime dependencies.
 |---|---|
 | `SecureSocketChannel` | A `SocketChannel` decorator that transparently encrypts writes and decrypts reads. Non-I/O operations are delegated to the underlying raw channel. |
 | `SecureServerSocketChannel` | A `ServerSocketChannel` decorator that produces `SecureSocketChannel` instances (with server-mode `SSLEngine`s from a supplied `SSLContext`) for each accepted connection. |
-| `SecureDatagramChannel` | A `DatagramChannel` decorator that transparently encrypts and decrypts datagrams with DTLS. Operates in connected mode only – one DTLS session per peer pair. |
+| `SecureDatagramChannel` | A `DatagramChannel` decorator that transparently encrypts and decrypts datagrams with DTLS. Unicast, connected mode only – one DTLS session per peer pair; multicast is not supported. |
 | `DelegatingSelectorProvider` | A `SelectorProvider` that opens `Selector`s capable of registering the TLS/DTLS-wrapped channels above, transparently unwrapping them to the raw channel on registration. |
 
 ## Installation
@@ -86,7 +86,7 @@ a non-blocking client and server exchanging data over TLS.
 
 `SecureDatagramChannel` secures unicast UDP with DTLS 1.2 using the JDK's DTLS `SSLEngine`.
 The channel operates in connected mode only:
-the DTLS session is bound to a single peer, so the underlying channel must be connected before any secure I/O (`disconnect()` and multicast `join` are unsupported).
+the DTLS session is bound to a single peer, so the underlying channel must be connected before any secure I/O.
 
 ```java
 SSLContext sslContext = SSLContext.getInstance("DTLS");
@@ -118,6 +118,23 @@ The `close_notify` alert sent on `close()` is likewise a single datagram deliver
 * Path MTU: To avoid IP fragmentation, constrain the datagram size via `SSLParameters.setMaximumPacketSize(...)` (for example `1432` for Ethernet-sized MTUs) on the engine before constructing the channel.
 
 See [`DTLSLoopbackTestCase`](impl/src/test/java/io/github/rhusar/securenio/channels/DTLSLoopbackTestCase.java) for a complete end-to-end example, including handshake recovery from packet loss.
+
+
+#### No multicast support
+
+`SecureDatagramChannel` is unicast-only, by design and permanently.
+A DTLS session always secures a conversation between exactly two endpoints:
+the handshake verifies who the other side is and derives keys that only those two hold.
+There is no meaningful way to map that onto a multicast group, where an arbitrary and changing set of receivers must decrypt the same datagram –
+that requires a group key management protocol (see RFC 3740 and RFC 5374), which is out of scope for this library and cannot be expressed through the JDK's `SSLEngine`.
+
+Thus:
+
+* `join(InetAddress, NetworkInterface)` and `join(InetAddress, NetworkInterface, InetAddress)` always throw `UnsupportedOperationException`,
+* `disconnect()` likewise throws – close the channel instead,
+* the `IP_MULTICAST_*` socket options are delegated to the raw channel and remain settable, but have no effect – no group can ever be joined.
+
+If you need to protect multicast traffic, secure the payload at the application layer – for example with a pre-shared group key – rather than at the transport layer.
 
 ## Building
 

@@ -33,6 +33,14 @@ import javax.net.ssl.SSLEngine;
  * Consequently {@link #disconnect()} and multicast {@code join} are unsupported, and
  * {@link #send(ByteBuffer, SocketAddress)} only accepts the connected peer's address.
  * <p>
+ * <strong>Connected mode is a security property, not merely a simplification, and must not be
+ * relaxed.</strong> Because the socket is connected, the kernel discards datagrams from any source
+ * other than the single peer address before they ever reach the DTLS engine. Combined with the DTLS
+ * record MAC, this closes the off-path injection surface and denies an attacker the unauthenticated
+ * traffic needed to mount a DoS or amplification attack against the handshake. Accepting datagrams
+ * from arbitrary sources would forfeit that filtering and expose the engine directly to spoofed
+ * input.
+ * <p>
  * The engine must be created from an {@code SSLContext} of type {@code "DTLS"}. To avoid IP
  * fragmentation on MTU-limited paths, configure
  * {@link javax.net.ssl.SSLParameters#setMaximumPacketSize(int)} (for example {@code 1432} for
