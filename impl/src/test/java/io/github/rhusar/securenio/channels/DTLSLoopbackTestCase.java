@@ -6,8 +6,10 @@ package io.github.rhusar.securenio.channels;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
+import java.io.EOFException;
 import java.io.InputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -321,6 +323,135 @@ public class DTLSLoopbackTestCase {
     }
 
     /**
+     * A peer may coalesce multiple DTLS application records into a single UDP datagram. Each record
+     * must then be delivered by its own read with message boundaries preserved — successive reads
+     * drain the datagram one record at a time — rather than the records being concatenated into one
+     * read and the excess truncated. The coalescing peer is simulated with a datagram proxy that
+     * holds the client's first application-data datagram and sends it concatenated with the second.
+     */
+    @Test
+    public void coalescedRecordsAreDeliveredOnePerRead() throws Exception {
+        // DTLS 1.2 record header starts with the content type; application_data is 23.
+        final byte contentTypeApplicationData = 23;
+
+        DelegatingSelectorProvider selectorProvider = new DelegatingSelectorProvider();
+
+        try (DatagramChannel proxyChannel = boundLoopbackChannel()) {
+            proxyChannel.configureBlocking(false);
+            SocketAddress proxyAddress = proxyChannel.getLocalAddress();
+
+            DatagramChannel rawClientChannel = boundLoopbackChannel();
+            DatagramChannel rawServerChannel = boundLoopbackChannel();
+            SocketAddress clientAddress = rawClientChannel.getLocalAddress();
+            SocketAddress serverAddress = rawServerChannel.getLocalAddress();
+            rawClientChannel.connect(proxyAddress);
+            rawServerChannel.connect(proxyAddress);
+
+            SecureDatagramChannel clientChannel = secureChannel(rawClientChannel, true);
+            SecureDatagramChannel serverChannel = secureChannel(rawServerChannel, false);
+
+            try (Selector clientSelector = selectorProvider.openSelector();
+                 Selector serverSelector = selectorProvider.openSelector()) {
+
+                clientChannel.register(clientSelector, SelectionKey.OP_READ);
+                serverChannel.register(serverSelector, SelectionKey.OP_READ);
+
+                byte[][] messages = {
+                        "first coalesced message".getBytes(),
+                        "second coalesced message".getBytes(),
+                };
+                int sent = 0;
+                List<byte[]> received = new ArrayList<>();
+                ByteBuffer heldAppData = null;
+
+                ByteBuffer proxyBuf = ByteBuffer.allocate(64 * 1024);
+                ByteBuffer readBuf = ByteBuffer.allocate(1024);
+
+                long deadline = System.currentTimeMillis() + TEST_TIMEOUT_MS;
+                long lastProgress = System.currentTimeMillis();
+
+                while (received.size() < messages.length && System.currentTimeMillis() < deadline) {
+
+                    // Proxy pump: forward handshake datagrams as-is, but hold the client's first
+                    // application-data datagram and deliver it concatenated with the second as a
+                    // single coalesced datagram.
+                    for (;;) {
+                        proxyBuf.clear();
+                        SocketAddress sender = proxyChannel.receive(proxyBuf);
+                        if (sender == null) {
+                            break;
+                        }
+                        proxyBuf.flip();
+                        if (sender.equals(clientAddress) && proxyBuf.hasRemaining()
+                                && proxyBuf.get(0) == contentTypeApplicationData) {
+                            if (heldAppData == null) {
+                                heldAppData = ByteBuffer.allocate(proxyBuf.remaining()).put(proxyBuf).flip();
+                            } else {
+                                ByteBuffer coalesced = ByteBuffer.allocate(heldAppData.remaining() + proxyBuf.remaining())
+                                        .put(heldAppData).put(proxyBuf).flip();
+                                proxyChannel.send(coalesced, serverAddress);
+                            }
+                        } else if (sender.equals(clientAddress)) {
+                            proxyChannel.send(proxyBuf, serverAddress);
+                        } else {
+                            proxyChannel.send(proxyBuf, clientAddress);
+                        }
+                    }
+
+                    clientSelector.select(10);
+                    clientSelector.selectedKeys().clear();
+                    serverSelector.selectNow();
+                    serverSelector.selectedKeys().clear();
+
+                    boolean progressed = false;
+
+                    if (sent < messages.length) {
+                        ByteBuffer writeBuf = ByteBuffer.wrap(messages[sent]);
+                        clientChannel.write(writeBuf);
+                        if (!writeBuf.hasRemaining()) {
+                            sent++;
+                            progressed = true;
+                        }
+                    }
+
+                    // Drain the coalesced datagram: one read per record until nothing remains.
+                    for (;;) {
+                        readBuf.clear();
+                        if (serverChannel.read(readBuf) <= 0) {
+                            break;
+                        }
+                        readBuf.flip();
+                        byte[] message = new byte[readBuf.remaining()];
+                        readBuf.get(message);
+                        received.add(message);
+                        progressed = true;
+                    }
+
+                    // The client must also read to make handshake progress on the server's flights.
+                    readBuf.clear();
+                    clientChannel.read(readBuf);
+
+                    if (progressed) {
+                        lastProgress = System.currentTimeMillis();
+                    } else if (System.currentTimeMillis() - lastProgress > RETRANSMIT_STALL_MS) {
+                        clientChannel.retransmit();
+                        serverChannel.retransmit();
+                        lastProgress = System.currentTimeMillis();
+                    }
+                }
+
+                assertEquals("each coalesced record must arrive as its own message", messages.length, received.size());
+                for (int i = 0; i < messages.length; i++) {
+                    assertArrayEquals(messages[i], received.get(i));
+                }
+            } finally {
+                clientChannel.close();
+                serverChannel.close();
+            }
+        }
+    }
+
+    /**
      * A graceful {@link SecureDatagramChannel#close()} must transmit a {@code close_notify} alert
      * so the peer's next read reports {@code -1} rather than silence. Unlike TLS over TCP the alert
      * is a single datagram and delivery is best-effort, but over loopback it must arrive.
@@ -405,6 +536,11 @@ public class DTLSLoopbackTestCase {
                 }
             }
             assertTrue("server never observed the peer's close_notify", sawClose);
+
+            // receive() has no return value that can express the ended session – null means "no
+            // datagram" – so it must report the peer close by throwing rather than masking it.
+            readBuf.clear();
+            assertThrows(EOFException.class, () -> serverChannel.receive(readBuf));
         } finally {
             clientChannel.close();
             serverChannel.close();

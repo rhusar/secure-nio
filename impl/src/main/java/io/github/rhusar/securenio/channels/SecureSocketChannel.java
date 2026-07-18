@@ -11,8 +11,10 @@ import java.net.SocketOption;
 import java.nio.ByteBuffer;
 import java.nio.channels.IllegalBlockingModeException;
 import java.nio.channels.SocketChannel;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 
 import javax.net.ssl.SSLEngine;
@@ -46,6 +48,12 @@ import javax.net.ssl.SSLEngine;
  * @author Radoslav Husar
  */
 public class SecureSocketChannel extends SocketChannel {
+
+    /**
+     * Bounded wait to acquire {@link #lock} on close, so a wedged lock holder (e.g. a stalled
+     * delegated task) cannot block {@code close()} indefinitely.
+     */
+    private static final long CLOSE_LOCK_TIMEOUT_MILLIS = 1000;
 
     private final SocketChannel delegate;
     private final TLSByteChannel tlsChannel;
@@ -83,6 +91,10 @@ public class SecureSocketChannel extends SocketChannel {
      */
     @Override
     public int read(ByteBuffer dst) throws IOException {
+        Objects.requireNonNull(dst);
+        if (dst.isReadOnly()) {
+            throw new IllegalArgumentException("Read-only buffer");
+        }
         requireNonBlocking();
         lock.lock();
         try {
@@ -99,6 +111,7 @@ public class SecureSocketChannel extends SocketChannel {
 
     @Override
     public long read(ByteBuffer[] dsts, int offset, int length) throws IOException {
+        Objects.checkFromIndexSize(offset, length, dsts.length);
         long totalRead = 0;
         for (int i = offset; i < offset + length; i++) {
             ByteBuffer region = dsts[i];
@@ -128,6 +141,7 @@ public class SecureSocketChannel extends SocketChannel {
      */
     @Override
     public int write(ByteBuffer src) throws IOException {
+        Objects.requireNonNull(src);
         requireNonBlocking();
         lock.lock();
         try {
@@ -144,6 +158,7 @@ public class SecureSocketChannel extends SocketChannel {
 
     @Override
     public long write(ByteBuffer[] srcs, int offset, int length) throws IOException {
+        Objects.checkFromIndexSize(offset, length, srcs.length);
         long totalWritten = 0;
         for (int i = offset; i < offset + length; i++) {
             ByteBuffer region = srcs[i];
@@ -167,14 +182,43 @@ public class SecureSocketChannel extends SocketChannel {
 
     @Override
     protected void implCloseSelectableChannel() throws IOException {
+        // The TLS engine is not thread-safe, so driving it here must hold the same lock that
+        // serializes read() and write() – close() can run concurrently with in-flight I/O on
+        // another thread. The wait is bounded so a wedged lock holder cannot block close
+        // indefinitely; on timeout the engine is left untouched (close_notify is best-effort
+        // anyway) and only the raw socket is closed.
+        boolean locked = false;
         try {
-            // Announce closure with a close_notify alert while the raw socket is still open, so a
-            // compliant peer does not mistake our shutdown for a truncation attack.
-            tlsChannel.closeOutbound();
-        } catch (Exception ignored) {
-        } finally {
+            locked = lock.tryLock(CLOSE_LOCK_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        if (!locked) {
             delegate.close();
-            tlsChannel.shutdown();
+            return;
+        }
+        try {
+            IOException closeNotifyFailure = null;
+            try {
+                // Announce closure with a close_notify alert while the raw socket is still open, so a
+                // compliant peer does not mistake our shutdown for a truncation attack. If the raw
+                // socket is already closed the alert is impossible and there is nothing to report.
+                if (delegate.isOpen()) {
+                    tlsChannel.closeOutbound();
+                }
+            } catch (IOException e) {
+                // Deferred, not swallowed: the raw socket must be closed and the engine shut down
+                // regardless, and only then can the failed close_notify be reported to the caller.
+                closeNotifyFailure = e;
+            } finally {
+                delegate.close();
+                tlsChannel.shutdown();
+            }
+            if (closeNotifyFailure != null) {
+                throw closeNotifyFailure;
+            }
+        } finally {
+            lock.unlock();
         }
     }
 

@@ -27,13 +27,29 @@ final class TLSByteChannel {
     /** Empty source buffer used when wrapping the {@code close_notify} alert, which carries no payload. */
     private static final ByteBuffer EMPTY = ByteBuffer.allocate(0);
 
+    /**
+     * Defensive bound on engine cycles per loop, mirroring {@link DTLSByteChannel}: the engine
+     * normally guarantees progress, but records that decrypt to zero plaintext (TLS 1.3
+     * {@code NewSessionTicket}, {@code KeyUpdate}) consume none of the caller's buffer, so a peer
+     * streaming them could otherwise keep a thread inside the loop for as long as it keeps sending,
+     * never returning to the selector and starving every other connection served by that thread.
+     * When the bound is hit, control returns to the caller and processing resumes on the next read
+     * or write.
+     */
+    private static final int MAX_ENGINE_LOOPS = 256;
+
     private final SocketChannel rawChannel;
     private final SSLEngine engine;
     private final ExecutorService taskExecutor;
 
-    private final ByteBuffer networkInboundStore;
-    private final ByteBuffer networkOutboundStore;
-    private final ByteBuffer decryptionScratchpad;
+    // Buffers are sized from the initial session and re-grown when the engine expands the
+    // session's buffer sizes, which JSSE does upon receiving a record larger than the spec
+    // maximum but within its large-record tolerance (twice the maximum, for interoperability
+    // with old buggy stacks). The encryption scratchpad is exempt: it is only ever an empty
+    // wrap source used to pump the handshake.
+    private ByteBuffer networkInboundStore;
+    private ByteBuffer networkOutboundStore;
+    private ByteBuffer decryptionScratchpad;
     private final ByteBuffer encryptionScratchpad;
 
     TLSByteChannel(SocketChannel rawChannel, SSLEngine engine, ExecutorService taskExecutor) {
@@ -67,11 +83,16 @@ final class TLSByteChannel {
 
         int decrypted;
         int encrypted;
+        int cycles = 0;
 
+        // Each callee is internally capped at MAX_ENGINE_LOOPS, but this alternation re-enters
+        // them whenever network progress was made, so it must be bounded as well or a sustained
+        // zero-plaintext record stream would defeat those caps.
         do {
-            decrypted = performDecryption(decryptionScratchpad);
+            decrypted = performDecryption();
             encrypted = performEncryption(encryptionScratchpad);
-        } while (decrypted > 0 || (encrypted > 0 && networkOutboundStore.hasRemaining() && networkInboundStore.hasRemaining()));
+        } while ((decrypted > 0 || (encrypted > 0 && networkOutboundStore.hasRemaining() && networkInboundStore.hasRemaining()))
+                && ++cycles < MAX_ENGINE_LOOPS);
 
         // Transfer newly decrypted data to the caller's buffer
         transferFromScratchpad(applicationInputRegion);
@@ -108,7 +129,7 @@ final class TLSByteChannel {
      */
     int encrypt(ByteBuffer applicationOutboundRegion) throws IOException {
         int encrypted = performEncryption(applicationOutboundRegion);
-        performDecryption(decryptionScratchpad);
+        performDecryption();
         return encrypted;
     }
 
@@ -140,14 +161,19 @@ final class TLSByteChannel {
                 }
             }
 
-            if (result.getStatus() == SSLEngineResult.Status.CLOSED) {
+            // A wrap that produced nothing and did not close cannot make progress by re-looping —
+            // e.g. an engine wedged mid-handshake after a fatal error keeps reporting OK with zero
+            // bytes while isOutboundDone() stays false, which would spin this loop forever.
+            if (result.getStatus() == SSLEngineResult.Status.CLOSED || result.bytesProduced() == 0) {
                 break;
             }
         }
     }
 
     /**
-     * Shuts down the TLS engine, suppressing any faults.
+     * Shuts down the TLS engine. Faults are suppressed by design: {@code closeInbound()} throws an
+     * {@code SSLException} whenever the peer's {@code close_notify} has not arrived, which is
+     * routine on a locally initiated close and not actionable once the raw socket is gone.
      */
     void shutdown() {
         try {
@@ -160,8 +186,9 @@ final class TLSByteChannel {
         }
     }
 
-    private int performDecryption(ByteBuffer applicationInputRegion) throws IOException {
+    private int performDecryption() throws IOException {
         int totalReadFromNetwork = 0;
+        int loops = 0;
 
         outer:
         do {
@@ -196,7 +223,7 @@ final class TLSByteChannel {
 
                 totalReadFromNetwork += sessionBytesRead;
 
-                SSLEngineResult result = engine.unwrap(networkInboundStore, applicationInputRegion);
+                SSLEngineResult result = engine.unwrap(networkInboundStore, decryptionScratchpad);
 
                 // Phase 3: Interpret result
                 switch (result.getStatus()) {
@@ -216,7 +243,20 @@ final class TLSByteChannel {
                         break;
 
                     case BUFFER_OVERFLOW:
-                        break outer;
+                        // If the scratchpad's capacity accommodates a full application record
+                        // beyond the plaintext it already holds, the overflow only means that
+                        // plaintext has not been drained yet — stop so the caller can drain it.
+                        // Otherwise the engine expanded the session's application buffer size
+                        // and the scratchpad must grow, or the record can never be unwrapped.
+                        int applicationSize = engine.getSession().getApplicationBufferSize();
+                        if (applicationSize + decryptionScratchpad.position() <= decryptionScratchpad.capacity()) {
+                            break outer;
+                        }
+                        ByteBuffer enlargedScratchpad = ByteBuffer.allocate(applicationSize + decryptionScratchpad.position());
+                        decryptionScratchpad.flip();
+                        enlargedScratchpad.put(decryptionScratchpad);
+                        decryptionScratchpad = enlargedScratchpad;
+                        continue;
 
                     case CLOSED:
                         if (totalReadFromNetwork == 0) {
@@ -226,6 +266,21 @@ final class TLSByteChannel {
                         }
 
                     case BUFFER_UNDERFLOW:
+                        // The engine expands the session's packet size upon seeing the header of
+                        // a record larger than the buffer this store was sized from (tolerated up
+                        // to twice the spec maximum, for interoperability with old buggy stacks).
+                        // The store must grow along with it: at its original capacity the record
+                        // could never fit, so every subsequent read would report underflow with
+                        // the record's tail still pending in the kernel — a level-triggered
+                        // selector would fire forever, spinning the CPU at 100% without progress.
+                        int packetSize = engine.getSession().getPacketBufferSize();
+                        if (packetSize > networkInboundStore.capacity()) {
+                            ByteBuffer enlargedStore = ByteBuffer.allocate(packetSize);
+                            enlargedStore.put(networkInboundStore);
+                            enlargedStore.flip();
+                            networkInboundStore = enlargedStore;
+                            continue;
+                        }
                         // A partial TLS record remains in the inbound buffer and the engine needs
                         // more bytes to decrypt it. If no new data arrived from the network this
                         // iteration, re-looping cannot make progress and would spin the CPU at 100%.
@@ -240,7 +295,7 @@ final class TLSByteChannel {
             } finally {
                 networkInboundStore.compact();
             }
-        } while (applicationInputRegion.hasRemaining());
+        } while (decryptionScratchpad.hasRemaining() && ++loops < MAX_ENGINE_LOOPS);
 
         return totalReadFromNetwork;
     }
@@ -259,7 +314,7 @@ final class TLSByteChannel {
 
         // Phase 2: Encrypt and transmit application data
         encryptCycle:
-        for (;;) {
+        for (int loops = 0; loops < MAX_ENGINE_LOOPS; loops++) {
             networkOutboundStore.compact();
 
             SSLEngineResult result = engine.wrap(applicationOutboundRegion, networkOutboundStore);
@@ -301,7 +356,24 @@ final class TLSByteChannel {
                     }
                     break;
 
-                case BUFFER_OVERFLOW, BUFFER_UNDERFLOW, CLOSED:
+                case BUFFER_OVERFLOW:
+                    // If the store's capacity accommodates a full packet beyond the unsent bytes
+                    // it already holds, the overflow is due to that backlog — stop and wait for
+                    // the socket to drain. Otherwise the engine expanded the session's packet
+                    // size and the store must grow, or wrap could never make progress. (JSSE
+                    // never wraps beyond the spec maximum the store was sized for, so the growth
+                    // path is defensive.)
+                    int packetSize = engine.getSession().getPacketBufferSize();
+                    if (packetSize + networkOutboundStore.remaining() <= networkOutboundStore.capacity()) {
+                        break encryptCycle;
+                    }
+                    ByteBuffer enlargedStore = ByteBuffer.allocate(packetSize + networkOutboundStore.remaining());
+                    enlargedStore.put(networkOutboundStore);
+                    enlargedStore.flip();
+                    networkOutboundStore = enlargedStore;
+                    continue;
+
+                case BUFFER_UNDERFLOW, CLOSED:
                     break encryptCycle;
             }
         }

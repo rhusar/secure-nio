@@ -4,6 +4,7 @@
  */
 package io.github.rhusar.securenio.channels;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
@@ -19,6 +20,7 @@ import java.nio.channels.NotYetConnectedException;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 
 import javax.net.ssl.SSLEngine;
@@ -32,6 +34,14 @@ import javax.net.ssl.SSLEngine;
  * underlying channel must be {@linkplain #connect(SocketAddress) connected} before any secure I/O.
  * Consequently {@link #disconnect()} and multicast {@code join} are unsupported, and
  * {@link #send(ByteBuffer, SocketAddress)} only accepts the connected peer's address.
+ * <p>
+ * <strong>Connected mode is a security property, not merely a simplification, and must not be
+ * relaxed.</strong> Because the socket is connected, the kernel discards datagrams from any source
+ * other than the single peer address before they ever reach the DTLS engine. Combined with the DTLS
+ * record MAC, this closes the off-path injection surface and denies an attacker the unauthenticated
+ * traffic needed to mount a DoS or amplification attack against the handshake. Accepting datagrams
+ * from arbitrary sources would forfeit that filtering and expose the engine directly to spoofed
+ * input.
  * <p>
  * The engine must be created from an {@code SSLContext} of type {@code "DTLS"}. To avoid IP
  * fragmentation on MTU-limited paths, configure
@@ -67,6 +77,12 @@ import javax.net.ssl.SSLEngine;
  * @author Radoslav Husar
  */
 public class SecureDatagramChannel extends DatagramChannel {
+
+    /**
+     * Bounded wait to acquire {@link #lock} on close, so a wedged lock holder (e.g. a stalled
+     * delegated task) cannot block {@code close()} indefinitely.
+     */
+    private static final long CLOSE_LOCK_TIMEOUT_MILLIS = 1000;
 
     private final DatagramChannel delegate;
     private final DTLSByteChannel dtlsChannel;
@@ -113,12 +129,21 @@ public class SecureDatagramChannel extends DatagramChannel {
 
     /**
      * {@inheritDoc}
+     * <p>
+     * At most one DTLS application record (one message) is delivered per call, preserving message
+     * boundaries. A peer may coalesce several records into a single datagram; the surplus is
+     * buffered and returned by subsequent reads without touching the network, so after the
+     * selector signals readability callers should keep reading until this method returns 0.
      *
      * @throws IllegalBlockingModeException if this channel is in blocking mode; only non-blocking
      *                                      mode is supported (see the class documentation)
      */
     @Override
     public int read(ByteBuffer dst) throws IOException {
+        Objects.requireNonNull(dst);
+        if (dst.isReadOnly()) {
+            throw new IllegalArgumentException("Read-only buffer");
+        }
         checkConnected();
         requireNonBlocking();
         lock.lock();
@@ -131,6 +156,7 @@ public class SecureDatagramChannel extends DatagramChannel {
 
     @Override
     public long read(ByteBuffer[] dsts, int offset, int length) throws IOException {
+        Objects.checkFromIndexSize(offset, length, dsts.length);
         // A single datagram's plaintext is delivered into the first buffer with room; datagram
         // semantics discard what does not fit, so spreading across buffers is not attempted.
         for (int i = offset; i < offset + length; i++) {
@@ -149,6 +175,7 @@ public class SecureDatagramChannel extends DatagramChannel {
      */
     @Override
     public int write(ByteBuffer src) throws IOException {
+        Objects.requireNonNull(src);
         checkConnected();
         requireNonBlocking();
         lock.lock();
@@ -161,6 +188,7 @@ public class SecureDatagramChannel extends DatagramChannel {
 
     @Override
     public long write(ByteBuffer[] srcs, int offset, int length) throws IOException {
+        Objects.checkFromIndexSize(offset, length, srcs.length);
         long totalWritten = 0;
         for (int i = offset; i < offset + length; i++) {
             ByteBuffer region = srcs[i];
@@ -179,10 +207,30 @@ public class SecureDatagramChannel extends DatagramChannel {
         return totalWritten;
     }
 
+    /**
+     * {@inheritDoc}
+     * <p>
+     * The {@code receive()} contract has no return value that can express end-of-stream, so a peer
+     * close is reported by throwing: once the peer has ended the DTLS session with a
+     * {@code close_notify} alert – the condition {@link #read(ByteBuffer)} reports as {@code -1} –
+     * this method throws {@link EOFException} instead of returning {@code null}, which would be
+     * indistinguishable from no datagram having arrived.
+     *
+     * @throws EOFException if the peer has closed the DTLS session with a {@code close_notify} alert
+     */
     @Override
     public SocketAddress receive(ByteBuffer dst) throws IOException {
+        // Validated here as well as in read(ByteBuffer) so that a read-only destination is rejected
+        // before the connected-state check, matching the order the DatagramChannel contract implies.
+        if (dst.isReadOnly()) {
+            throw new IllegalArgumentException("Read-only buffer");
+        }
         checkConnected();
-        return this.read(dst) > 0 ? delegate.getRemoteAddress() : null;
+        int read = this.read(dst);
+        if (read < 0) {
+            throw new EOFException("DTLS session closed by peer");
+        }
+        return read > 0 ? delegate.getRemoteAddress() : null;
     }
 
     /**
@@ -195,6 +243,7 @@ public class SecureDatagramChannel extends DatagramChannel {
      */
     @Override
     public int send(ByteBuffer src, SocketAddress target) throws IOException {
+        Objects.requireNonNull(src);
         checkConnected();
         if (!Objects.equals(target, delegate.getRemoteAddress())) {
             throw new AlreadyConnectedException();
@@ -235,14 +284,43 @@ public class SecureDatagramChannel extends DatagramChannel {
 
     @Override
     protected void implCloseSelectableChannel() throws IOException {
+        // The DTLS engine is not thread-safe, so driving it here must hold the same lock that
+        // serializes read() and write() – close() can run concurrently with in-flight I/O on
+        // another thread. The wait is bounded so a wedged lock holder cannot block close
+        // indefinitely; on timeout the engine is left untouched (close_notify is best-effort
+        // anyway) and only the raw socket is closed.
+        boolean locked = false;
         try {
-            // Announce closure with a best-effort close_notify alert while the raw socket is still
-            // open; the single datagram may be lost, which DTLS peers must tolerate.
-            dtlsChannel.closeOutbound();
-        } catch (Exception ignored) {
-        } finally {
+            locked = lock.tryLock(CLOSE_LOCK_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        if (!locked) {
             delegate.close();
-            dtlsChannel.shutdown();
+            return;
+        }
+        try {
+            IOException closeNotifyFailure = null;
+            try {
+                // Announce closure with a best-effort close_notify alert while the raw socket is still
+                // open; the single datagram may be lost, which DTLS peers must tolerate. If the raw
+                // socket is already closed the alert is impossible and there is nothing to report.
+                if (delegate.isOpen()) {
+                    dtlsChannel.closeOutbound();
+                }
+            } catch (IOException e) {
+                // Deferred, not swallowed: the raw socket must be closed and the engine shut down
+                // regardless, and only then can the failed close_notify be reported to the caller.
+                closeNotifyFailure = e;
+            } finally {
+                delegate.close();
+                dtlsChannel.shutdown();
+            }
+            if (closeNotifyFailure != null) {
+                throw closeNotifyFailure;
+            }
+        } finally {
+            lock.unlock();
         }
     }
 
