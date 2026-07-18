@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DelegatingSelector.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Secure NIO</a> &gt; <a href="index.source.html" class="el_package">io.github.rhusar.securenio.channels.spi</a> &gt; <span class="el_source">DelegatingSelector.java</span></div><h1>DelegatingSelector.java</h1><pre class="source lang-java linenums">/*
+ * Copyright Radoslav Husar and contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package io.github.rhusar.securenio.channels.spi;
+
+import java.io.IOException;
+import java.nio.channels.ClosedChannelException;
+import java.nio.channels.SelectableChannel;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
+import java.nio.channels.spi.AbstractSelectableChannel;
+import java.nio.channels.spi.AbstractSelector;
+import java.nio.channels.spi.SelectorProvider;
+import java.util.Set;
+import java.util.function.Consumer;
+
+import io.github.rhusar.securenio.channels.SecureDatagramChannel;
+import io.github.rhusar.securenio.channels.SecureServerSocketChannel;
+import io.github.rhusar.securenio.channels.SecureSocketChannel;
+
+/**
+ * A {@link Selector} that delegates all operations to a real system selector, but intercepts
+ * channel registration to unwrap TLS/DTLS-wrapped channels before registration.
+ * &lt;p&gt;
+ * When a {@link SecureSocketChannel}, {@link SecureServerSocketChannel}, or
+ * {@link SecureDatagramChannel} is registered, the underlying raw channel is registered with the
+ * real selector instead. This avoids the JDK-internal {@code sun.nio.ch.SelChImpl} type check in
+ * {@code SelectorImpl.register()}.
+ *
+ * @author Radoslav Husar
+ */
+class DelegatingSelector extends AbstractSelector {
+
+    private final Selector delegate;
+
+    DelegatingSelector(SelectorProvider provider, Selector delegate) {
+<span class="fc" id="L38">        super(provider);</span>
+<span class="fc" id="L39">        this.delegate = delegate;</span>
+<span class="fc" id="L40">    }</span>
+
+    @Override
+    protected SelectionKey register(AbstractSelectableChannel channel, int ops, Object attachment) {
+<span class="fc" id="L44">        SelectableChannel raw = unwrap(channel);</span>
+        try {
+<span class="fc" id="L46">            return raw.register(this.delegate, ops, attachment);</span>
+<span class="nc" id="L47">        } catch (ClosedChannelException e) {</span>
+<span class="nc" id="L48">            throw new IllegalStateException(e);</span>
+        }
+    }
+
+    private static SelectableChannel unwrap(AbstractSelectableChannel channel) {
+<span class="fc bfc" id="L53" title="All 2 branches covered.">        if (channel instanceof SecureSocketChannel secure) {</span>
+<span class="fc" id="L54">            return secure.delegate();</span>
+        }
+<span class="fc bfc" id="L56" title="All 2 branches covered.">        if (channel instanceof SecureServerSocketChannel secure) {</span>
+<span class="fc" id="L57">            return secure.delegate();</span>
+        }
+<span class="fc bfc" id="L59" title="All 2 branches covered.">        if (channel instanceof SecureDatagramChannel secure) {</span>
+<span class="fc" id="L60">            return secure.delegate();</span>
+        }
+<span class="fc" id="L62">        return channel;</span>
+    }
+
+    @Override
+    public Set&lt;SelectionKey&gt; keys() {
+<span class="fc" id="L67">        return this.delegate.keys();</span>
+    }
+
+    @Override
+    public Set&lt;SelectionKey&gt; selectedKeys() {
+<span class="fc" id="L72">        return this.delegate.selectedKeys();</span>
+    }
+
+    @Override
+    public int selectNow() throws IOException {
+<span class="fc" id="L77">        return this.delegate.selectNow();</span>
+    }
+
+    @Override
+    public int select(long timeout) throws IOException {
+<span class="fc" id="L82">        return this.delegate.select(timeout);</span>
+    }
+
+    @Override
+    public int select() throws IOException {
+<span class="nc" id="L87">        return this.delegate.select();</span>
+    }
+
+    @Override
+    public int select(Consumer&lt;SelectionKey&gt; action, long timeout) throws IOException {
+<span class="nc" id="L92">        return this.delegate.select(action, timeout);</span>
+    }
+
+    @Override
+    public int select(Consumer&lt;SelectionKey&gt; action) throws IOException {
+<span class="nc" id="L97">        return this.delegate.select(action);</span>
+    }
+
+    @Override
+    public int selectNow(Consumer&lt;SelectionKey&gt; action) throws IOException {
+<span class="nc" id="L102">        return this.delegate.selectNow(action);</span>
+    }
+
+    @Override
+    public Selector wakeup() {
+<span class="fc" id="L107">        this.delegate.wakeup();</span>
+<span class="fc" id="L108">        return this;</span>
+    }
+
+    @Override
+    protected void implCloseSelector() throws IOException {
+<span class="fc" id="L113">        this.delegate.close();</span>
+<span class="fc" id="L114">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.15.202606040825</span></div></body></html>

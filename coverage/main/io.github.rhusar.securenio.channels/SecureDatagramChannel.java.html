@@ -1,0 +1,392 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SecureDatagramChannel.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Secure NIO</a> &gt; <a href="index.source.html" class="el_package">io.github.rhusar.securenio.channels</a> &gt; <span class="el_source">SecureDatagramChannel.java</span></div><h1>SecureDatagramChannel.java</h1><pre class="source lang-java linenums">/*
+ * Copyright Radoslav Husar and contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package io.github.rhusar.securenio.channels;
+
+import java.io.EOFException;
+import java.io.IOException;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
+import java.net.SocketAddress;
+import java.net.SocketOption;
+import java.nio.ByteBuffer;
+import java.nio.channels.AlreadyConnectedException;
+import java.nio.channels.DatagramChannel;
+import java.nio.channels.IllegalBlockingModeException;
+import java.nio.channels.MembershipKey;
+import java.nio.channels.NotYetConnectedException;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
+
+import javax.net.ssl.SSLEngine;
+
+/**
+ * A {@link DatagramChannel} decorator that transparently wraps a raw channel with DTLS encryption
+ * and decryption. All cryptographic operations are handled internally via {@link DTLSByteChannel},
+ * while non-I/O operations are delegated to the underlying raw channel.
+ * &lt;p&gt;
+ * The channel operates in connected mode only: the DTLS session is bound to a single peer, so the
+ * underlying channel must be {@linkplain #connect(SocketAddress) connected} before any secure I/O.
+ * Consequently {@link #disconnect()} and multicast {@code join} are unsupported, and
+ * {@link #send(ByteBuffer, SocketAddress)} only accepts the connected peer's address.
+ * &lt;p&gt;
+ * &lt;strong&gt;Connected mode is a security property, not merely a simplification, and must not be
+ * relaxed.&lt;/strong&gt; Because the socket is connected, the kernel discards datagrams from any source
+ * other than the single peer address before they ever reach the DTLS engine. Combined with the DTLS
+ * record MAC, this closes the off-path injection surface and denies an attacker the unauthenticated
+ * traffic needed to mount a DoS or amplification attack against the handshake. Accepting datagrams
+ * from arbitrary sources would forfeit that filtering and expose the engine directly to spoofed
+ * input.
+ * &lt;p&gt;
+ * The engine must be created from an {@code SSLContext} of type {@code &quot;DTLS&quot;}. To avoid IP
+ * fragmentation on MTU-limited paths, configure
+ * {@link javax.net.ssl.SSLParameters#setMaximumPacketSize(int)} (for example {@code 1432} for
+ * Ethernet-sized MTUs) on the engine before constructing this channel.
+ * &lt;p&gt;
+ * The DTLS engine has no handshake retransmission timer. When a selector-driven caller observes no
+ * progress while {@link #isHandshaking()} — typically a {@code select(timeout)} that expires — it
+ * must call {@link #retransmit()} to re-send the last handshake flight lost in transit. The
+ * {@code close_notify} alert sent on {@link #close()} is a single datagram delivered best-effort.
+ * &lt;p&gt;
+ * Read and write operations are mutually exclusive — they share the same lock to serialize
+ * concurrent access to the DTLS engine, which is not thread-safe.
+ * &lt;p&gt;
+ * &lt;strong&gt;This channel supports non-blocking mode only.&lt;/strong&gt; The retransmission model above is
+ * inherently selector-driven: a lost handshake flight is detected because a {@code select(timeout)}
+ * expires with no progress, which is what prompts the caller to invoke {@link #retransmit()}. In
+ * blocking mode the underlying {@code read()} would instead wait forever for a datagram that was
+ * lost — the peer is meanwhile waiting for a retransmission that never comes — deadlocking the
+ * handshake on the first dropped packet (an inevitability over UDP). Both {@link #read(ByteBuffer)}
+ * and {@link #write(ByteBuffer)} therefore reject blocking mode with an
+ * {@link java.nio.channels.IllegalBlockingModeException}; call {@code configureBlocking(false)}
+ * before performing I/O.
+ * &lt;p&gt;
+ * This channel cannot be directly registered with a {@link java.nio.channels.Selector}.
+ * Instead, the underlying raw channel should be registered, with this secure channel
+ * attached to the resulting {@link java.nio.channels.SelectionKey}:
+ * &lt;pre&gt;{@code
+ * SelectionKey key = secureChannel.delegate().register(selector, SelectionKey.OP_READ);
+ * key.attach(secureChannel);
+ * }&lt;/pre&gt;
+ *
+ * @author Radoslav Husar
+ */
+public class SecureDatagramChannel extends DatagramChannel {
+
+    /**
+     * Bounded wait to acquire {@link #lock} on close, so a wedged lock holder (e.g. a stalled
+     * delegated task) cannot block {@code close()} indefinitely.
+     */
+    private static final long CLOSE_LOCK_TIMEOUT_MILLIS = 1000;
+
+    private final DatagramChannel delegate;
+    private final DTLSByteChannel dtlsChannel;
+<span class="fc" id="L89">    private final ReentrantLock lock = new ReentrantLock();</span>
+
+    public SecureDatagramChannel(DatagramChannel delegate, SSLEngine engine, ExecutorService taskExecutor) {
+<span class="fc" id="L92">        super(delegate.provider());</span>
+<span class="fc" id="L93">        this.delegate = delegate;</span>
+<span class="fc" id="L94">        this.dtlsChannel = new DTLSByteChannel(delegate, engine, taskExecutor);</span>
+<span class="fc" id="L95">    }</span>
+
+    /**
+     * Returns the underlying raw (unencrypted) channel, for use with selector registration.
+     */
+    public DatagramChannel delegate() {
+<span class="fc" id="L101">        return delegate;</span>
+    }
+
+    /**
+     * Re-sends the last handshake flight. The DTLS engine has no retransmission timer, so callers
+     * must invoke this when the handshake stalls — no datagram arrives within their select timeout
+     * while {@link #isHandshaking()} — indicating a flight was lost. No-op when not handshaking.
+     */
+    public void retransmit() throws IOException {
+<span class="fc" id="L110">        lock.lock();</span>
+        try {
+<span class="fc" id="L112">            dtlsChannel.retransmit();</span>
+        } finally {
+<span class="fc" id="L114">            lock.unlock();</span>
+        }
+<span class="fc" id="L116">    }</span>
+
+    /**
+     * Returns whether the DTLS handshake is currently in progress.
+     */
+    public boolean isHandshaking() {
+<span class="nc" id="L122">        lock.lock();</span>
+        try {
+<span class="nc" id="L124">            return dtlsChannel.isHandshaking();</span>
+        } finally {
+<span class="nc" id="L126">            lock.unlock();</span>
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     * &lt;p&gt;
+     * At most one DTLS application record (one message) is delivered per call, preserving message
+     * boundaries. A peer may coalesce several records into a single datagram; the surplus is
+     * buffered and returned by subsequent reads without touching the network, so after the
+     * selector signals readability callers should keep reading until this method returns 0.
+     *
+     * @throws IllegalBlockingModeException if this channel is in blocking mode; only non-blocking
+     *                                      mode is supported (see the class documentation)
+     */
+    @Override
+    public int read(ByteBuffer dst) throws IOException {
+<span class="fc" id="L143">        Objects.requireNonNull(dst);</span>
+<span class="fc bfc" id="L144" title="All 2 branches covered.">        if (dst.isReadOnly()) {</span>
+<span class="fc" id="L145">            throw new IllegalArgumentException(&quot;Read-only buffer&quot;);</span>
+        }
+<span class="fc" id="L147">        checkConnected();</span>
+<span class="fc" id="L148">        requireNonBlocking();</span>
+<span class="fc" id="L149">        lock.lock();</span>
+        try {
+<span class="fc" id="L151">            return dtlsChannel.decrypt(dst);</span>
+        } finally {
+<span class="fc" id="L153">            lock.unlock();</span>
+        }
+    }
+
+    @Override
+    public long read(ByteBuffer[] dsts, int offset, int length) throws IOException {
+<span class="fc" id="L159">        Objects.checkFromIndexSize(offset, length, dsts.length);</span>
+        // A single datagram's plaintext is delivered into the first buffer with room; datagram
+        // semantics discard what does not fit, so spreading across buffers is not attempted.
+<span class="pc bpc" id="L162" title="1 of 2 branches missed.">        for (int i = offset; i &lt; offset + length; i++) {</span>
+<span class="pc bpc" id="L163" title="1 of 2 branches missed.">            if (dsts[i].hasRemaining()) {</span>
+<span class="nc" id="L164">                return this.read(dsts[i]);</span>
+            }
+        }
+<span class="nc" id="L167">        return 0;</span>
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @throws IllegalBlockingModeException if this channel is in blocking mode; only non-blocking
+     *                                      mode is supported (see the class documentation)
+     */
+    @Override
+    public int write(ByteBuffer src) throws IOException {
+<span class="fc" id="L178">        Objects.requireNonNull(src);</span>
+<span class="fc" id="L179">        checkConnected();</span>
+<span class="fc" id="L180">        requireNonBlocking();</span>
+<span class="fc" id="L181">        lock.lock();</span>
+        try {
+<span class="fc" id="L183">            return dtlsChannel.encrypt(src);</span>
+        } finally {
+<span class="fc" id="L185">            lock.unlock();</span>
+        }
+    }
+
+    @Override
+    public long write(ByteBuffer[] srcs, int offset, int length) throws IOException {
+<span class="nc" id="L191">        Objects.checkFromIndexSize(offset, length, srcs.length);</span>
+<span class="nc" id="L192">        long totalWritten = 0;</span>
+<span class="nc bnc" id="L193" title="All 2 branches missed.">        for (int i = offset; i &lt; offset + length; i++) {</span>
+<span class="nc" id="L194">            ByteBuffer region = srcs[i];</span>
+<span class="nc bnc" id="L195" title="All 2 branches missed.">            if (region.hasRemaining()) {</span>
+<span class="nc" id="L196">                int written = this.write(region);</span>
+<span class="nc bnc" id="L197" title="All 2 branches missed.">                if (written &gt; 0) {</span>
+<span class="nc" id="L198">                    totalWritten += written;</span>
+<span class="nc bnc" id="L199" title="All 2 branches missed.">                    if (region.hasRemaining()) {</span>
+<span class="nc" id="L200">                        break;</span>
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+<span class="nc" id="L207">        return totalWritten;</span>
+    }
+
+    /**
+     * {@inheritDoc}
+     * &lt;p&gt;
+     * The {@code receive()} contract has no return value that can express end-of-stream, so a peer
+     * close is reported by throwing: once the peer has ended the DTLS session with a
+     * {@code close_notify} alert – the condition {@link #read(ByteBuffer)} reports as {@code -1} –
+     * this method throws {@link EOFException} instead of returning {@code null}, which would be
+     * indistinguishable from no datagram having arrived.
+     *
+     * @throws EOFException if the peer has closed the DTLS session with a {@code close_notify} alert
+     */
+    @Override
+    public SocketAddress receive(ByteBuffer dst) throws IOException {
+        // Validated here as well as in read(ByteBuffer) so that a read-only destination is rejected
+        // before the connected-state check, matching the order the DatagramChannel contract implies.
+<span class="fc bfc" id="L225" title="All 2 branches covered.">        if (dst.isReadOnly()) {</span>
+<span class="fc" id="L226">            throw new IllegalArgumentException(&quot;Read-only buffer&quot;);</span>
+        }
+<span class="fc" id="L228">        checkConnected();</span>
+<span class="fc" id="L229">        int read = this.read(dst);</span>
+<span class="pc bpc" id="L230" title="1 of 2 branches missed.">        if (read &lt; 0) {</span>
+<span class="fc" id="L231">            throw new EOFException(&quot;DTLS session closed by peer&quot;);</span>
+        }
+<span class="nc bnc" id="L233" title="All 2 branches missed.">        return read &gt; 0 ? delegate.getRemoteAddress() : null;</span>
+    }
+
+    /**
+     * {@inheritDoc}
+     *
+     * @throws AlreadyConnectedException if {@code target} is not the connected peer's address.
+     *         Although the name suggests a connect-time error, this is the exception type the
+     *         {@link DatagramChannel#send(ByteBuffer, SocketAddress) DatagramChannel contract}
+     *         specifies for sending to an address other than the connected one.
+     */
+    @Override
+    public int send(ByteBuffer src, SocketAddress target) throws IOException {
+<span class="fc" id="L246">        Objects.requireNonNull(src);</span>
+<span class="fc" id="L247">        checkConnected();</span>
+<span class="pc bpc" id="L248" title="1 of 2 branches missed.">        if (!Objects.equals(target, delegate.getRemoteAddress())) {</span>
+<span class="fc" id="L249">            throw new AlreadyConnectedException();</span>
+        }
+<span class="nc" id="L251">        return this.write(src);</span>
+    }
+
+    @Override
+    public DatagramChannel connect(SocketAddress remote) throws IOException {
+<span class="fc" id="L256">        delegate.connect(remote);</span>
+<span class="fc" id="L257">        return this;</span>
+    }
+
+    /**
+     * @throws UnsupportedOperationException always — the DTLS session is bound to a single peer;
+     *         close the channel instead
+     */
+    @Override
+    public DatagramChannel disconnect() {
+<span class="fc" id="L266">        throw new UnsupportedOperationException();</span>
+    }
+
+    /**
+     * @throws UnsupportedOperationException always — multicast is not supported over DTLS
+     */
+    @Override
+    public MembershipKey join(InetAddress group, NetworkInterface interf) {
+<span class="fc" id="L274">        throw new UnsupportedOperationException();</span>
+    }
+
+    /**
+     * @throws UnsupportedOperationException always — multicast is not supported over DTLS
+     */
+    @Override
+    public MembershipKey join(InetAddress group, NetworkInterface interf, InetAddress source) {
+<span class="fc" id="L282">        throw new UnsupportedOperationException();</span>
+    }
+
+    @Override
+    protected void implCloseSelectableChannel() throws IOException {
+        // The DTLS engine is not thread-safe, so driving it here must hold the same lock that
+        // serializes read() and write() – close() can run concurrently with in-flight I/O on
+        // another thread. The wait is bounded so a wedged lock holder cannot block close
+        // indefinitely; on timeout the engine is left untouched (close_notify is best-effort
+        // anyway) and only the raw socket is closed.
+<span class="fc" id="L292">        boolean locked = false;</span>
+        try {
+<span class="fc" id="L294">            locked = lock.tryLock(CLOSE_LOCK_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);</span>
+<span class="nc" id="L295">        } catch (InterruptedException e) {</span>
+<span class="nc" id="L296">            Thread.currentThread().interrupt();</span>
+<span class="fc" id="L297">        }</span>
+<span class="fc bfc" id="L298" title="All 2 branches covered.">        if (!locked) {</span>
+<span class="fc" id="L299">            delegate.close();</span>
+<span class="fc" id="L300">            return;</span>
+        }
+        try {
+<span class="fc" id="L303">            IOException closeNotifyFailure = null;</span>
+            try {
+                // Announce closure with a best-effort close_notify alert while the raw socket is still
+                // open; the single datagram may be lost, which DTLS peers must tolerate. If the raw
+                // socket is already closed the alert is impossible and there is nothing to report.
+<span class="pc bpc" id="L308" title="1 of 2 branches missed.">                if (delegate.isOpen()) {</span>
+<span class="fc" id="L309">                    dtlsChannel.closeOutbound();</span>
+                }
+<span class="fc" id="L311">            } catch (IOException e) {</span>
+                // Deferred, not swallowed: the raw socket must be closed and the engine shut down
+                // regardless, and only then can the failed close_notify be reported to the caller.
+<span class="fc" id="L314">                closeNotifyFailure = e;</span>
+            } finally {
+<span class="fc" id="L316">                delegate.close();</span>
+<span class="fc" id="L317">                dtlsChannel.shutdown();</span>
+            }
+<span class="fc bfc" id="L319" title="All 2 branches covered.">            if (closeNotifyFailure != null) {</span>
+<span class="fc" id="L320">                throw closeNotifyFailure;</span>
+            }
+        } finally {
+<span class="fc" id="L323">            lock.unlock();</span>
+        }
+<span class="fc" id="L325">    }</span>
+
+    @Override
+    protected void implConfigureBlocking(boolean block) throws IOException {
+<span class="fc" id="L329">        delegate.configureBlocking(block);</span>
+<span class="fc" id="L330">    }</span>
+
+    @Override
+    public boolean isConnected() {
+<span class="fc" id="L334">        return delegate.isConnected();</span>
+    }
+
+    @Override
+    public SocketAddress getRemoteAddress() throws IOException {
+<span class="fc" id="L339">        return delegate.getRemoteAddress();</span>
+    }
+
+    @Override
+    public SocketAddress getLocalAddress() throws IOException {
+<span class="fc" id="L344">        return delegate.getLocalAddress();</span>
+    }
+
+    @Override
+    public DatagramChannel bind(SocketAddress local) throws IOException {
+<span class="fc" id="L349">        delegate.bind(local);</span>
+<span class="fc" id="L350">        return this;</span>
+    }
+
+    @Override
+    public &lt;T&gt; DatagramChannel setOption(SocketOption&lt;T&gt; name, T value) throws IOException {
+<span class="fc" id="L355">        delegate.setOption(name, value);</span>
+<span class="fc" id="L356">        return this;</span>
+    }
+
+    @Override
+    public &lt;T&gt; T getOption(SocketOption&lt;T&gt; name) throws IOException {
+<span class="fc" id="L361">        return delegate.getOption(name);</span>
+    }
+
+    @Override
+    public Set&lt;SocketOption&lt;?&gt;&gt; supportedOptions() {
+<span class="fc" id="L366">        return delegate.supportedOptions();</span>
+    }
+
+    @Override
+    public DatagramSocket socket() {
+<span class="fc" id="L371">        return delegate.socket();</span>
+    }
+
+    private void checkConnected() {
+<span class="fc bfc" id="L375" title="All 2 branches covered.">        if (!delegate.isConnected()) {</span>
+<span class="fc" id="L376">            throw new NotYetConnectedException();</span>
+        }
+<span class="fc" id="L378">    }</span>
+
+    /**
+     * Guards against blocking-mode I/O, which this channel does not support: a blocking read would
+     * wait forever for a datagram that may have been lost, with no {@code select} timeout to prompt
+     * the {@link #retransmit()} the handshake needs to recover, deadlocking on the first dropped
+     * packet.
+     */
+    private void requireNonBlocking() {
+<span class="fc bfc" id="L387" title="All 2 branches covered.">        if (isBlocking()) {</span>
+<span class="fc" id="L388">            throw new IllegalBlockingModeException();</span>
+        }
+<span class="fc" id="L390">    }</span>
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.15.202606040825</span></div></body></html>

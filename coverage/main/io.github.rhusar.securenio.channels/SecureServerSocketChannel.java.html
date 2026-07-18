@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>SecureServerSocketChannel.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Secure NIO</a> &gt; <a href="index.source.html" class="el_package">io.github.rhusar.securenio.channels</a> &gt; <span class="el_source">SecureServerSocketChannel.java</span></div><h1>SecureServerSocketChannel.java</h1><pre class="source lang-java linenums">/*
+ * Copyright Radoslav Husar and contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package io.github.rhusar.securenio.channels;
+
+import java.io.IOException;
+import java.net.ServerSocket;
+import java.net.SocketAddress;
+import java.net.SocketOption;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLEngine;
+
+/**
+ * A {@link ServerSocketChannel} decorator that wraps a raw server socket channel, producing
+ * {@link SecureSocketChannel} instances for each accepted connection. The TLS engine for each
+ * accepted channel is configured in server mode using the provided {@link SSLContext}.
+ * &lt;p&gt;
+ * Non-accept operations are delegated transparently to the underlying raw server channel.
+ *
+ * @author Radoslav Husar
+ */
+public class SecureServerSocketChannel extends ServerSocketChannel {
+
+    private final ServerSocketChannel delegate;
+    private final SSLContext sslContext;
+    private final ExecutorService taskExecutor;
+
+    public SecureServerSocketChannel(ServerSocketChannel delegate, SSLContext sslContext, ExecutorService taskExecutor) {
+<span class="fc" id="L35">        super(delegate.provider());</span>
+
+<span class="fc" id="L37">        this.delegate = delegate;</span>
+<span class="fc" id="L38">        this.sslContext = sslContext;</span>
+<span class="fc" id="L39">        this.taskExecutor = taskExecutor;</span>
+<span class="fc" id="L40">    }</span>
+
+    /**
+     * Returns the underlying raw (unencrypted) server channel.
+     */
+    public ServerSocketChannel delegate() {
+<span class="fc" id="L46">        return delegate;</span>
+    }
+
+    @Override
+    public SocketChannel accept() throws IOException {
+<span class="fc" id="L51">        SocketChannel rawChannel = delegate.accept();</span>
+<span class="fc bfc" id="L52" title="All 2 branches covered.">        if (rawChannel == null) {</span>
+<span class="fc" id="L53">            return null;</span>
+        }
+
+<span class="fc" id="L56">        SSLEngine engine = sslContext.createSSLEngine();</span>
+<span class="fc" id="L57">        engine.setUseClientMode(false);</span>
+
+<span class="fc" id="L59">        return new SecureSocketChannel(rawChannel, engine, taskExecutor);</span>
+    }
+
+    @Override
+    protected void implCloseSelectableChannel() throws IOException {
+<span class="fc" id="L64">        delegate.close();</span>
+<span class="fc" id="L65">    }</span>
+
+    @Override
+    protected void implConfigureBlocking(boolean block) throws IOException {
+<span class="fc" id="L69">        delegate.configureBlocking(block);</span>
+<span class="fc" id="L70">    }</span>
+
+    @Override
+    public ServerSocketChannel bind(SocketAddress local, int backlog) throws IOException {
+<span class="fc" id="L74">        delegate.bind(local, backlog);</span>
+<span class="fc" id="L75">        return this;</span>
+    }
+
+    @Override
+    public &lt;T&gt; ServerSocketChannel setOption(SocketOption&lt;T&gt; name, T value) throws IOException {
+<span class="fc" id="L80">        delegate.setOption(name, value);</span>
+<span class="fc" id="L81">        return this;</span>
+    }
+
+    @Override
+    public &lt;T&gt; T getOption(SocketOption&lt;T&gt; name) throws IOException {
+<span class="fc" id="L86">        return delegate.getOption(name);</span>
+    }
+
+    @Override
+    public Set&lt;SocketOption&lt;?&gt;&gt; supportedOptions() {
+<span class="fc" id="L91">        return delegate.supportedOptions();</span>
+    }
+
+    @Override
+    public ServerSocket socket() {
+<span class="fc" id="L96">        return delegate.socket();</span>
+    }
+
+    @Override
+    public SocketAddress getLocalAddress() throws IOException {
+<span class="fc" id="L101">        return delegate.getLocalAddress();</span>
+    }
+
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.15.202606040825</span></div></body></html>

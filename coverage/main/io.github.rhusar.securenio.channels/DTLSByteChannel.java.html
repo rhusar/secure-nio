@@ -1,0 +1,394 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DTLSByteChannel.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Secure NIO</a> &gt; <a href="index.source.html" class="el_package">io.github.rhusar.securenio.channels</a> &gt; <span class="el_source">DTLSByteChannel.java</span></div><h1>DTLSByteChannel.java</h1><pre class="source lang-java linenums">/*
+ * Copyright Radoslav Husar and contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package io.github.rhusar.securenio.channels;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.DatagramChannel;
+import java.util.concurrent.ExecutorService;
+
+import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLEngineResult;
+import javax.net.ssl.SSLSession;
+
+/**
+ * Internal engine that orchestrates all DTLS protocol mechanics: handshake state machines,
+ * payload encryption, payload decryption, and delegated computational tasks.
+ * &lt;p&gt;
+ * This class wraps a raw connected {@link DatagramChannel} and a DTLS-mode {@link SSLEngine}.
+ * Unlike its stream sibling {@link TLSByteChannel}, it preserves datagram and record boundaries:
+ * each {@code wrap} produces exactly one datagram that is transmitted whole, and each
+ * {@code decrypt} delivers at most one application record. When a peer coalesces several
+ * application records into a single datagram, the surplus records are retained and delivered one
+ * per subsequent {@code decrypt} call rather than concatenated into one read. There is no
+ * partial-record accumulation (UDP delivers whole datagrams or nothing), no end-of-stream or
+ * truncation handling (UDP has no EOF), and plaintext of a single record exceeding the caller's
+ * buffer is discarded per standard datagram truncation semantics rather than carried over.
+ * &lt;p&gt;
+ * The DTLS engine has no retransmission timer of its own: when a handshake flight is lost, the
+ * caller must invoke {@link #retransmit()} after a timeout to make the engine reproduce it.
+ *
+ * @author Radoslav Husar
+ */
+final class DTLSByteChannel {
+
+    /** Empty source buffer used when wrapping handshake flights and alerts, which carry no payload. */
+<span class="fc" id="L38">    private static final ByteBuffer EMPTY = ByteBuffer.allocate(0);</span>
+
+    /**
+     * Defensive bound on wrap/unwrap cycles per call, mirroring the JDK's own DTLS examples: the
+     * engine normally guarantees progress, but a misbehaving peer must not be able to pin a thread
+     * in an unbounded engine loop.
+     */
+    private static final int MAX_ENGINE_LOOPS = 256;
+
+    private final DatagramChannel rawChannel;
+    private final SSLEngine engine;
+    private final ExecutorService taskExecutor;
+
+    // Buffers are sized from the initial session and re-grown on BUFFER_OVERFLOW: the negotiated
+    // session's buffer sizes can exceed the pre-handshake session's.
+    /**
+     * Holds at most one received datagram at a time. Records not yet unwrapped — the surplus of a
+     * coalesced datagram — remain between its position and limit across {@code decrypt} calls.
+     */
+    private final ByteBuffer networkInboundStore;
+    /** Holds at most one wrapped datagram awaiting transmission; never accumulates a second. */
+    private ByteBuffer networkOutboundStore;
+    private ByteBuffer decryptionScratchpad;
+
+<span class="fc" id="L62">    DTLSByteChannel(DatagramChannel rawChannel, SSLEngine engine, ExecutorService taskExecutor) {</span>
+<span class="fc" id="L63">        this.rawChannel = rawChannel;</span>
+<span class="fc" id="L64">        this.engine = engine;</span>
+<span class="fc" id="L65">        this.taskExecutor = taskExecutor;</span>
+
+<span class="fc" id="L67">        SSLSession session = engine.getSession();</span>
+
+<span class="fc" id="L69">        this.networkInboundStore = ByteBuffer.allocate(session.getPacketBufferSize());</span>
+<span class="fc" id="L70">        this.networkInboundStore.flip();</span>
+<span class="fc" id="L71">        this.networkOutboundStore = ByteBuffer.allocate(session.getPacketBufferSize());</span>
+<span class="fc" id="L72">        this.networkOutboundStore.flip();</span>
+
+<span class="fc" id="L74">        this.decryptionScratchpad = ByteBuffer.allocate(session.getApplicationBufferSize());</span>
+<span class="fc" id="L75">    }</span>
+
+    /**
+     * Receives and decrypts at most one datagram, depositing plaintext into the application region.
+     * Handshake flights are processed transparently, including emitting responding flights.
+     * &lt;p&gt;
+     * At most one application record is delivered per call. When the datagram coalesces several
+     * application records, the surplus is retained and delivered by subsequent calls — which drain
+     * it before touching the network — so callers should keep reading until 0 is returned.
+     *
+     * @return plaintext bytes delivered, 0 if no datagram arrived or it carried only handshake
+     *         records, or -1 if the peer has closed the session with a {@code close_notify} alert
+     */
+    int decrypt(ByteBuffer applicationInputRegion) throws IOException {
+<span class="fc bfc" id="L89" title="All 2 branches covered.">        if (engine.isInboundDone()) {</span>
+<span class="fc" id="L90">            return -1;</span>
+        }
+
+        // Records retained from a previously received coalesced datagram are drained first; a new
+        // datagram is received only once the store is empty.
+<span class="fc bfc" id="L95" title="All 2 branches covered.">        if (!networkInboundStore.hasRemaining()) {</span>
+<span class="fc" id="L96">            networkInboundStore.clear();</span>
+<span class="fc" id="L97">            int received = rawChannel.read(networkInboundStore);</span>
+<span class="fc" id="L98">            networkInboundStore.flip();</span>
+
+            // Nothing arrived (non-blocking read; UDP has no end-of-stream, so a negative return is
+            // treated the same). Still enter the unwrap loop when the engine holds internally buffered
+            // reordered records (NEED_UNWRAP_AGAIN) — those must be processed without new network data.
+<span class="pc bpc" id="L103" title="1 of 4 branches missed.">            if (received &lt;= 0 &amp;&amp; engine.getHandshakeStatus() != SSLEngineResult.HandshakeStatus.NEED_UNWRAP_AGAIN) {</span>
+<span class="fc" id="L104">                return 0;</span>
+            }
+        }
+
+<span class="fc" id="L108">        boolean closed = false;</span>
+<span class="fc" id="L109">        int loops = 0;</span>
+
+        unwrapLoop:
+<span class="fc bfc" id="L112" title="All 2 branches covered.">        while ((networkInboundStore.hasRemaining()</span>
+<span class="pc bpc" id="L113" title="1 of 4 branches missed.">                || engine.getHandshakeStatus() == SSLEngineResult.HandshakeStatus.NEED_UNWRAP_AGAIN)</span>
+                &amp;&amp; loops++ &lt; MAX_ENGINE_LOOPS) {
+
+<span class="fc" id="L116">            SSLEngineResult result = engine.unwrap(networkInboundStore, decryptionScratchpad);</span>
+
+<span class="pc bpc" id="L118" title="3 of 5 branches missed.">            switch (result.getStatus()) {</span>
+                case OK:
+<span class="fc bfc" id="L120" title="All 3 branches covered.">                    switch (result.getHandshakeStatus()) {</span>
+                        case NEED_TASK:
+<span class="fc" id="L122">                            DelegatedTasks.run(engine, taskExecutor);</span>
+<span class="fc" id="L123">                            continue;</span>
+                        case NEED_WRAP:
+                            // Emit the responding flight, then keep draining any records remaining
+                            // in this datagram. If the flight could not be fully transmitted (a
+                            // datagram is still pending), stop — wrapping further would merge
+                            // datagrams; transmission resumes on the next write/flush/retransmit.
+<span class="fc" id="L129">                            performEncryption(EMPTY);</span>
+<span class="pc bpc" id="L130" title="1 of 2 branches missed.">                            if (engine.getHandshakeStatus() == SSLEngineResult.HandshakeStatus.NEED_WRAP) {</span>
+<span class="nc" id="L131">                                break unwrapLoop;</span>
+                            }
+                            continue;
+                        default:
+                            // NEED_UNWRAP, NEED_UNWRAP_AGAIN, FINISHED, NOT_HANDSHAKING: a datagram
+                            // may carry a coalesced multi-record flight — keep draining. An
+                            // application record instead ends the loop: it is delivered on its own,
+                            // and any records after it stay in the store for the next call.
+<span class="fc bfc" id="L139" title="All 2 branches covered.">                            if (result.bytesProduced() &gt; 0) {</span>
+<span class="fc" id="L140">                                break unwrapLoop;</span>
+                            }
+                            continue;
+                    }
+
+                case BUFFER_UNDERFLOW:
+                    // In DTLS this signals a truncated or garbage datagram, not a partial stream
+                    // record — UDP delivers whole datagrams. Drop the rest of it.
+<span class="nc" id="L148">                    networkInboundStore.position(networkInboundStore.limit());</span>
+<span class="nc" id="L149">                    break unwrapLoop;</span>
+
+                case BUFFER_OVERFLOW:
+                    // The negotiated session needs a larger application buffer than the
+                    // pre-handshake session it was sized from; grow and retry.
+<span class="nc" id="L154">                    int applicationSize = engine.getSession().getApplicationBufferSize();</span>
+<span class="nc bnc" id="L155" title="All 2 branches missed.">                    if (applicationSize + decryptionScratchpad.position() &lt;= decryptionScratchpad.capacity()) {</span>
+<span class="nc" id="L156">                        break unwrapLoop;</span>
+                    }
+<span class="nc" id="L158">                    ByteBuffer enlarged = ByteBuffer.allocate(applicationSize + decryptionScratchpad.position());</span>
+<span class="nc" id="L159">                    decryptionScratchpad.flip();</span>
+<span class="nc" id="L160">                    enlarged.put(decryptionScratchpad);</span>
+<span class="nc" id="L161">                    decryptionScratchpad = enlarged;</span>
+<span class="nc" id="L162">                    continue;</span>
+
+                case CLOSED:
+<span class="fc" id="L165">                    closed = true;</span>
+<span class="fc" id="L166">                    break unwrapLoop;</span>
+            }
+<span class="nc" id="L168">        }</span>
+
+        // The loop can exit still owing the peer a flight — e.g. a NEED_TASK transition that ends
+        // in NEED_WRAP once the datagram is fully consumed (also the responding close_notify after
+        // CLOSED). Emit it now, or the handshake deadlocks with both sides waiting.
+<span class="fc bfc" id="L173" title="All 2 branches covered.">        if (engine.getHandshakeStatus() == SSLEngineResult.HandshakeStatus.NEED_WRAP) {</span>
+<span class="fc" id="L174">            performEncryption(EMPTY);</span>
+        }
+
+<span class="fc" id="L177">        int delivered = transferToCaller(applicationInputRegion);</span>
+<span class="pc bpc" id="L178" title="1 of 4 branches missed.">        if (closed &amp;&amp; delivered == 0) {</span>
+<span class="fc" id="L179">            return -1;</span>
+        }
+<span class="fc" id="L181">        return delivered;</span>
+    }
+
+    /**
+     * Encrypts application data into a single datagram and transmits it. During the handshake no
+     * application data is consumed; instead any outstanding handshake flights are produced and sent.
+     *
+     * @return application bytes consumed (0 while the handshake is in progress or the socket
+     *         buffer is full)
+     */
+    int encrypt(ByteBuffer applicationOutboundRegion) throws IOException {
+<span class="fc" id="L192">        return performEncryption(applicationOutboundRegion);</span>
+    }
+
+    /**
+     * Re-produces and transmits the engine's previous handshake flight. The DTLS engine has no
+     * timer, so the caller invokes this when its select timeout expires without handshake progress,
+     * indicating the flight (or the peer's response) was lost. No-op when not handshaking.
+     */
+    void retransmit() throws IOException {
+<span class="pc bpc" id="L201" title="2 of 4 branches missed.">        if (!isHandshaking() || engine.isOutboundDone()) {</span>
+<span class="nc" id="L202">            return;</span>
+        }
+
+        // The engine reproduces the previous flight one datagram per wrap and reports NEED_WRAP
+        // while more of it remains. Stop on any other status: wrapping again while NEED_UNWRAP
+        // would start reproducing the flight anew, spinning forever.
+<span class="pc bpc" id="L208" title="1 of 2 branches missed.">        for (int i = 0; i &lt; MAX_ENGINE_LOOPS; i++) {</span>
+<span class="pc bpc" id="L209" title="1 of 2 branches missed.">            if (!transmitPending()) {</span>
+<span class="nc" id="L210">                return;</span>
+            }
+
+<span class="fc" id="L213">            networkOutboundStore.clear();</span>
+<span class="fc" id="L214">            SSLEngineResult result = engine.wrap(EMPTY, networkOutboundStore);</span>
+<span class="fc" id="L215">            networkOutboundStore.flip();</span>
+
+<span class="pc bpc" id="L217" title="1 of 2 branches missed.">            if (result.getHandshakeStatus() == SSLEngineResult.HandshakeStatus.NEED_TASK) {</span>
+<span class="nc" id="L218">                DelegatedTasks.run(engine, taskExecutor);</span>
+<span class="nc" id="L219">                continue;</span>
+            }
+
+<span class="pc bpc" id="L222" title="1 of 2 branches missed.">            if (result.getStatus() == SSLEngineResult.Status.BUFFER_OVERFLOW) {</span>
+<span class="nc" id="L223">                int packetSize = engine.getSession().getPacketBufferSize();</span>
+<span class="nc bnc" id="L224" title="All 2 branches missed.">                if (packetSize &lt;= networkOutboundStore.capacity()) {</span>
+<span class="nc" id="L225">                    return;</span>
+                }
+<span class="nc" id="L227">                networkOutboundStore = ByteBuffer.allocate(packetSize);</span>
+<span class="nc" id="L228">                networkOutboundStore.flip();</span>
+<span class="nc" id="L229">                continue;</span>
+            }
+
+<span class="fc" id="L232">            transmitPending();</span>
+
+<span class="pc bpc" id="L234" title="1 of 2 branches missed.">            if (result.getHandshakeStatus() != SSLEngineResult.HandshakeStatus.NEED_WRAP) {</span>
+<span class="fc" id="L235">                return;</span>
+            }
+        }
+<span class="nc" id="L238">    }</span>
+
+    boolean isHandshaking() {
+<span class="pc bpc" id="L241" title="1 of 2 branches missed.">        return engine.getHandshakeStatus() != SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING;</span>
+    }
+
+    /**
+     * Initiates DTLS shutdown by transmitting a {@code close_notify} alert to the peer.
+     * &lt;p&gt;
+     * Unlike the stream variant there is no drain loop: the alert is a single datagram that may be
+     * lost in transit, and DTLS peers must tolerate that — delivery is strictly best-effort.
+     */
+    void closeOutbound() throws IOException {
+<span class="fc" id="L251">        engine.closeOutbound();</span>
+
+        // A pending datagram that cannot be sent right now also blocks the alert; give up rather
+        // than merge them or block the close path.
+<span class="pc bpc" id="L255" title="1 of 2 branches missed.">        if (!transmitPending()) {</span>
+<span class="nc" id="L256">            return;</span>
+        }
+
+<span class="fc" id="L259">        networkOutboundStore.clear();</span>
+<span class="fc" id="L260">        engine.wrap(EMPTY, networkOutboundStore);</span>
+<span class="fc" id="L261">        networkOutboundStore.flip();</span>
+<span class="fc" id="L262">        transmitPending();</span>
+<span class="fc" id="L263">    }</span>
+
+    /**
+     * Shuts down the DTLS engine. Faults are suppressed by design: {@code closeInbound()} throws an
+     * {@code SSLException} whenever the peer's {@code close_notify} has not arrived, which is
+     * routine on a locally initiated close and not actionable once the raw socket is gone.
+     */
+    void shutdown() {
+        try {
+<span class="fc" id="L272">            engine.closeInbound();</span>
+<span class="fc" id="L273">        } catch (Exception ignored) {</span>
+<span class="fc" id="L274">        }</span>
+        try {
+<span class="fc" id="L276">            engine.closeOutbound();</span>
+<span class="nc" id="L277">        } catch (Exception ignored) {</span>
+<span class="fc" id="L278">        }</span>
+<span class="fc" id="L279">    }</span>
+
+    private int performEncryption(ByteBuffer applicationOutboundRegion) throws IOException {
+<span class="fc" id="L282">        int startPosition = applicationOutboundRegion.position();</span>
+
+        // While the engine awaits peer data there is nothing useful to wrap: application data
+        // cannot be encrypted yet, and an empty wrap would re-produce the previous flight —
+        // repeated writes would flood the peer with retransmissions. Retransmission on loss is
+        // the caller's explicit decision via retransmit().
+<span class="fc" id="L288">        SSLEngineResult.HandshakeStatus handshakeStatus = engine.getHandshakeStatus();</span>
+<span class="pc bpc" id="L289" title="1 of 4 branches missed.">        if (handshakeStatus == SSLEngineResult.HandshakeStatus.NEED_UNWRAP</span>
+                || handshakeStatus == SSLEngineResult.HandshakeStatus.NEED_UNWRAP_AGAIN) {
+<span class="fc" id="L291">            transmitPending();</span>
+<span class="fc" id="L292">            return 0;</span>
+        }
+
+        // A previously wrapped datagram must leave before another wrap: appending to it would merge
+        // two datagrams into one send, and overwriting it would lose records.
+<span class="pc bpc" id="L297" title="1 of 2 branches missed.">        if (!transmitPending()) {</span>
+<span class="nc" id="L298">            return 0;</span>
+        }
+
+        encryptCycle:
+<span class="pc bpc" id="L302" title="1 of 2 branches missed.">        for (int loops = 0; loops &lt; MAX_ENGINE_LOOPS; loops++) {</span>
+<span class="fc" id="L303">            networkOutboundStore.clear();</span>
+
+<span class="fc" id="L305">            SSLEngineResult result = engine.wrap(applicationOutboundRegion, networkOutboundStore);</span>
+
+<span class="fc" id="L307">            networkOutboundStore.flip();</span>
+
+            // Transmit the wrapped datagram whole; a connected DatagramChannel write is
+            // all-or-nothing, so an unsent datagram simply stays pending.
+<span class="fc" id="L311">            boolean sent = transmitPending();</span>
+
+<span class="pc bpc" id="L313" title="1 of 4 branches missed.">            switch (result.getStatus()) {</span>
+                case OK:
+<span class="pc bpc" id="L315" title="1 of 4 branches missed.">                    switch (result.getHandshakeStatus()) {</span>
+                        case NEED_TASK:
+<span class="nc" id="L317">                            DelegatedTasks.run(engine, taskExecutor);</span>
+                            // Only keep wrapping if the engine still has output to produce;
+                            // wrapping while it awaits peer data re-produces the previous flight.
+<span class="nc bnc" id="L320" title="All 2 branches missed.">                            if (engine.getHandshakeStatus() == SSLEngineResult.HandshakeStatus.NEED_UNWRAP</span>
+<span class="nc bnc" id="L321" title="All 2 branches missed.">                                    || engine.getHandshakeStatus() == SSLEngineResult.HandshakeStatus.NEED_UNWRAP_AGAIN) {</span>
+<span class="nc" id="L322">                                break encryptCycle;</span>
+                            }
+                            continue;
+                        case NEED_WRAP:
+                            // Handshake flights span multiple datagrams, one per wrap.
+<span class="pc bpc" id="L327" title="1 of 2 branches missed.">                            if (!sent) {</span>
+<span class="nc" id="L328">                                break encryptCycle;</span>
+                            }
+                            continue;
+                        case FINISHED:
+                        case NOT_HANDSHAKING:
+                            // If this wrap only completed the handshake, wrap the caller's payload
+                            // now; a positive bytesProduced guarantees loop progress.
+<span class="pc bpc" id="L335" title="2 of 6 branches missed.">                            if (sent &amp;&amp; result.bytesConsumed() == 0 &amp;&amp; result.bytesProduced() &gt; 0</span>
+<span class="pc bpc" id="L336" title="1 of 2 branches missed.">                                    &amp;&amp; applicationOutboundRegion.hasRemaining()) {</span>
+<span class="nc" id="L337">                                continue;</span>
+                            }
+                            // Application data is one datagram per encrypt() call.
+                            break encryptCycle;
+                        default:
+                            // NEED_UNWRAP, NEED_UNWRAP_AGAIN: the peer's turn — the caller reads next.
+<span class="fc" id="L343">                            break encryptCycle;</span>
+                    }
+
+                case BUFFER_OVERFLOW:
+                    // The negotiated session produces larger datagrams than the pre-handshake
+                    // session the buffer was sized from; grow and retry.
+<span class="fc" id="L349">                    int packetSize = engine.getSession().getPacketBufferSize();</span>
+<span class="pc bpc" id="L350" title="1 of 2 branches missed.">                    if (packetSize &lt;= networkOutboundStore.capacity()) {</span>
+<span class="nc" id="L351">                        break encryptCycle;</span>
+                    }
+<span class="fc" id="L353">                    networkOutboundStore = ByteBuffer.allocate(packetSize);</span>
+<span class="fc" id="L354">                    networkOutboundStore.flip();</span>
+<span class="fc" id="L355">                    continue;</span>
+
+                case BUFFER_UNDERFLOW, CLOSED:
+<span class="fc" id="L358">                    break encryptCycle;</span>
+            }
+        }
+
+<span class="fc" id="L362">        return applicationOutboundRegion.position() - startPosition;</span>
+    }
+
+    /**
+     * Attempts to transmit the pending outbound datagram, if any.
+     *
+     * @return true if the outbound store is empty (nothing was pending, or it was sent whole)
+     */
+    private boolean transmitPending() throws IOException {
+<span class="fc bfc" id="L371" title="All 2 branches covered.">        if (networkOutboundStore.hasRemaining()) {</span>
+<span class="fc" id="L372">            rawChannel.write(networkOutboundStore);</span>
+        }
+<span class="pc bpc" id="L374" title="1 of 2 branches missed.">        return !networkOutboundStore.hasRemaining();</span>
+    }
+
+    /**
+     * Transfers decrypted plaintext to the caller's buffer. Excess plaintext that does not fit is
+     * discarded, matching {@link DatagramChannel} truncation semantics.
+     */
+    private int transferToCaller(ByteBuffer destination) {
+<span class="fc" id="L382">        decryptionScratchpad.flip();</span>
+<span class="fc" id="L383">        int transferable = Math.min(decryptionScratchpad.remaining(), destination.remaining());</span>
+<span class="fc bfc" id="L384" title="All 2 branches covered.">        if (transferable &gt; 0) {</span>
+<span class="fc" id="L385">            int oldLimit = decryptionScratchpad.limit();</span>
+<span class="fc" id="L386">            decryptionScratchpad.limit(decryptionScratchpad.position() + transferable);</span>
+<span class="fc" id="L387">            destination.put(decryptionScratchpad);</span>
+<span class="fc" id="L388">            decryptionScratchpad.limit(oldLimit);</span>
+        }
+<span class="fc" id="L390">        decryptionScratchpad.clear();</span>
+<span class="fc" id="L391">        return transferable;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.15.202606040825</span></div></body></html>

@@ -1,0 +1,402 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>TLSByteChannel.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Secure NIO</a> &gt; <a href="index.source.html" class="el_package">io.github.rhusar.securenio.channels</a> &gt; <span class="el_source">TLSByteChannel.java</span></div><h1>TLSByteChannel.java</h1><pre class="source lang-java linenums">/*
+ * Copyright Radoslav Husar and contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package io.github.rhusar.securenio.channels;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.SocketChannel;
+import java.util.concurrent.ExecutorService;
+
+import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLEngineResult;
+import javax.net.ssl.SSLSession;
+
+/**
+ * Internal engine that orchestrates all TLS/SSL protocol mechanics: handshake state machines,
+ * payload encryption, payload decryption, and delegated computational tasks.
+ * &lt;p&gt;
+ * This class wraps a raw {@link SocketChannel} and an {@link SSLEngine}, managing four internal
+ * byte buffers for network inbound/outbound data and decryption/encryption scratchpads.
+ *
+ * @author Radoslav Husar
+ */
+final class TLSByteChannel {
+
+    /** Empty source buffer used when wrapping the {@code close_notify} alert, which carries no payload. */
+<span class="fc" id="L28">    private static final ByteBuffer EMPTY = ByteBuffer.allocate(0);</span>
+
+    /**
+     * Defensive bound on engine cycles per loop, mirroring {@link DTLSByteChannel}: the engine
+     * normally guarantees progress, but records that decrypt to zero plaintext (TLS 1.3
+     * {@code NewSessionTicket}, {@code KeyUpdate}) consume none of the caller's buffer, so a peer
+     * streaming them could otherwise keep a thread inside the loop for as long as it keeps sending,
+     * never returning to the selector and starving every other connection served by that thread.
+     * When the bound is hit, control returns to the caller and processing resumes on the next read
+     * or write.
+     */
+    private static final int MAX_ENGINE_LOOPS = 256;
+
+    private final SocketChannel rawChannel;
+    private final SSLEngine engine;
+    private final ExecutorService taskExecutor;
+
+    // Buffers are sized from the initial session and re-grown when the engine expands the
+    // session's buffer sizes, which JSSE does upon receiving a record larger than the spec
+    // maximum but within its large-record tolerance (twice the maximum, for interoperability
+    // with old buggy stacks). The encryption scratchpad is exempt: it is only ever an empty
+    // wrap source used to pump the handshake.
+    private ByteBuffer networkInboundStore;
+    private ByteBuffer networkOutboundStore;
+    private ByteBuffer decryptionScratchpad;
+    private final ByteBuffer encryptionScratchpad;
+
+<span class="fc" id="L55">    TLSByteChannel(SocketChannel rawChannel, SSLEngine engine, ExecutorService taskExecutor) {</span>
+<span class="fc" id="L56">        this.rawChannel = rawChannel;</span>
+<span class="fc" id="L57">        this.engine = engine;</span>
+<span class="fc" id="L58">        this.taskExecutor = taskExecutor;</span>
+
+<span class="fc" id="L60">        SSLSession session = engine.getSession();</span>
+<span class="fc" id="L61">        int packetSize = session.getPacketBufferSize();</span>
+<span class="fc" id="L62">        int appSize = session.getApplicationBufferSize();</span>
+
+<span class="fc" id="L64">        this.networkInboundStore = ByteBuffer.allocate(packetSize);</span>
+<span class="fc" id="L65">        this.networkOutboundStore = ByteBuffer.allocate(packetSize);</span>
+<span class="fc" id="L66">        this.networkOutboundStore.flip();</span>
+
+<span class="fc" id="L68">        this.decryptionScratchpad = ByteBuffer.allocate(appSize);</span>
+<span class="fc" id="L69">        this.encryptionScratchpad = ByteBuffer.allocate(appSize);</span>
+<span class="fc" id="L70">        this.encryptionScratchpad.flip();</span>
+<span class="fc" id="L71">    }</span>
+
+    /**
+     * Decrypts data from the network and deposits plaintext into the application region.
+     *
+     * @return total network bytes consumed, or -1 if end-of-stream
+     */
+    int decrypt(ByteBuffer applicationInputRegion) throws IOException {
+<span class="fc" id="L79">        int startPosition = applicationInputRegion.position();</span>
+
+        // Drain residual decrypted data from previous cycle
+<span class="fc" id="L82">        transferFromScratchpad(applicationInputRegion);</span>
+
+        int decrypted;
+        int encrypted;
+<span class="fc" id="L86">        int cycles = 0;</span>
+
+        // Each callee is internally capped at MAX_ENGINE_LOOPS, but this alternation re-enters
+        // them whenever network progress was made, so it must be bounded as well or a sustained
+        // zero-plaintext record stream would defeat those caps.
+        do {
+<span class="fc" id="L92">            decrypted = performDecryption();</span>
+<span class="fc" id="L93">            encrypted = performEncryption(encryptionScratchpad);</span>
+<span class="pc bpc" id="L94" title="3 of 10 branches missed.">        } while ((decrypted &gt; 0 || (encrypted &gt; 0 &amp;&amp; networkOutboundStore.hasRemaining() &amp;&amp; networkInboundStore.hasRemaining()))</span>
+                &amp;&amp; ++cycles &lt; MAX_ENGINE_LOOPS);
+
+        // Transfer newly decrypted data to the caller's buffer
+<span class="fc" id="L98">        transferFromScratchpad(applicationInputRegion);</span>
+
+        // If end-of-stream was reached but plaintext was delivered to the caller in this call
+        // (residual from a previous cycle and/or freshly decrypted bytes), report that byte count
+        // now and defer the -1 to the next read. Returning -1 here would make the caller discard
+        // the bytes already placed in their buffer, violating the ReadableByteChannel contract.
+<span class="fc bfc" id="L104" title="All 4 branches covered.">        if (decrypted &lt; 0 &amp;&amp; applicationInputRegion.position() &gt; startPosition) {</span>
+<span class="fc" id="L105">            return applicationInputRegion.position() - startPosition;</span>
+        }
+
+<span class="fc" id="L108">        return decrypted;</span>
+    }
+
+    private void transferFromScratchpad(ByteBuffer destination) {
+<span class="fc bfc" id="L112" title="All 2 branches covered.">        if (decryptionScratchpad.position() &gt; 0) {</span>
+<span class="fc" id="L113">            decryptionScratchpad.flip();</span>
+<span class="fc" id="L114">            int transferable = Math.min(decryptionScratchpad.remaining(), destination.remaining());</span>
+<span class="fc bfc" id="L115" title="All 2 branches covered.">            if (transferable &gt; 0) {</span>
+<span class="fc" id="L116">                int oldLimit = decryptionScratchpad.limit();</span>
+<span class="fc" id="L117">                decryptionScratchpad.limit(decryptionScratchpad.position() + transferable);</span>
+<span class="fc" id="L118">                destination.put(decryptionScratchpad);</span>
+<span class="fc" id="L119">                decryptionScratchpad.limit(oldLimit);</span>
+            }
+<span class="fc" id="L121">            decryptionScratchpad.compact();</span>
+        }
+<span class="fc" id="L123">    }</span>
+
+    /**
+     * Encrypts application data and transmits it to the network.
+     *
+     * @return total network bytes sent, or -1 if the channel is closed
+     */
+    int encrypt(ByteBuffer applicationOutboundRegion) throws IOException {
+<span class="fc" id="L131">        int encrypted = performEncryption(applicationOutboundRegion);</span>
+<span class="fc" id="L132">        performDecryption();</span>
+<span class="fc" id="L133">        return encrypted;</span>
+    }
+
+    /**
+     * Initiates an orderly TLS shutdown by transmitting a {@code close_notify} alert to the peer.
+     * &lt;p&gt;
+     * Per the TLS spec (RFC 5246 §7.2.1, RFC 8446 §6.1) a peer must announce its intent to close
+     * with a {@code close_notify} alert; otherwise the connection looks like a truncation attack to
+     * a compliant peer. {@link SSLEngine#closeOutbound()} queues that alert, which this method then
+     * wraps and flushes to the network. The raw socket must remain open until the alert has been
+     * transmitted, so this must be called &lt;em&gt;before&lt;/em&gt; closing the underlying channel.
+     */
+    void closeOutbound() throws IOException {
+<span class="fc" id="L146">        engine.closeOutbound();</span>
+
+        // Drain the close_notify alert queued by closeOutbound() to the network. wrap() emits it and
+        // reports CLOSED; on a non-blocking channel that cannot accept it all right now this is
+        // best-effort, since we must not block the close path indefinitely.
+<span class="fc bfc" id="L151" title="All 2 branches covered.">        while (!engine.isOutboundDone()) {</span>
+<span class="fc" id="L152">            networkOutboundStore.compact();</span>
+<span class="fc" id="L153">            SSLEngineResult result = engine.wrap(EMPTY, networkOutboundStore);</span>
+<span class="fc" id="L154">            networkOutboundStore.flip();</span>
+
+<span class="fc bfc" id="L156" title="All 2 branches covered.">            if (networkOutboundStore.hasRemaining()) {</span>
+<span class="fc" id="L157">                int written = transmitToNetwork(networkOutboundStore);</span>
+<span class="pc bpc" id="L158" title="2 of 4 branches missed.">                if (written &lt; 0 || networkOutboundStore.hasRemaining()) {</span>
+                    // Peer gone or socket cannot drain further without blocking.
+<span class="nc" id="L160">                    break;</span>
+                }
+            }
+
+            // A wrap that produced nothing and did not close cannot make progress by re-looping —
+            // e.g. an engine wedged mid-handshake after a fatal error keeps reporting OK with zero
+            // bytes while isOutboundDone() stays false, which would spin this loop forever.
+<span class="pc bpc" id="L167" title="1 of 4 branches missed.">            if (result.getStatus() == SSLEngineResult.Status.CLOSED || result.bytesProduced() == 0) {</span>
+<span class="fc" id="L168">                break;</span>
+            }
+<span class="nc" id="L170">        }</span>
+<span class="fc" id="L171">    }</span>
+
+    /**
+     * Shuts down the TLS engine. Faults are suppressed by design: {@code closeInbound()} throws an
+     * {@code SSLException} whenever the peer's {@code close_notify} has not arrived, which is
+     * routine on a locally initiated close and not actionable once the raw socket is gone.
+     */
+    void shutdown() {
+        try {
+<span class="fc" id="L180">            engine.closeInbound();</span>
+<span class="fc" id="L181">        } catch (Exception ignored) {</span>
+<span class="fc" id="L182">        }</span>
+        try {
+<span class="fc" id="L184">            engine.closeOutbound();</span>
+<span class="nc" id="L185">        } catch (Exception ignored) {</span>
+<span class="fc" id="L186">        }</span>
+<span class="fc" id="L187">    }</span>
+
+    private int performDecryption() throws IOException {
+<span class="fc" id="L190">        int totalReadFromNetwork = 0;</span>
+<span class="fc" id="L191">        int loops = 0;</span>
+
+        outer:
+        do {
+            // Phase 1: Ingest encrypted data from network
+<span class="fc" id="L196">            int sessionBytesRead = 0;</span>
+<span class="fc bfc" id="L197" title="All 2 branches covered.">            while (networkInboundStore.hasRemaining()) {</span>
+<span class="fc" id="L198">                int bytesFromNetwork = rawChannel.read(networkInboundStore);</span>
+<span class="fc bfc" id="L199" title="All 2 branches covered.">                if (bytesFromNetwork &lt;= 0) {</span>
+<span class="fc bfc" id="L200" title="All 6 branches covered.">                    if (bytesFromNetwork &lt; 0 &amp;&amp; sessionBytesRead == 0 &amp;&amp; totalReadFromNetwork == 0) {</span>
+                        // End-of-stream on the raw channel. Per the TLS spec (RFC 5246 §7.2.1,
+                        // RFC 8446 §6.1), an EOF that arrives before the peer's close_notify alert
+                        // must be treated as an error rather than a clean end-of-stream: an active
+                        // attacker who cannot decrypt the traffic can still inject a TCP FIN/RST to
+                        // silently truncate the tail of a message. closeInbound() raises an
+                        // SSLException in exactly that case; if close_notify was already received it
+                        // is a harmless no-op and we report the clean end-of-stream.
+<span class="fc" id="L208">                        engine.closeInbound();</span>
+<span class="fc" id="L209">                        return bytesFromNetwork;</span>
+                    }
+                    break;
+                } else {
+<span class="fc" id="L213">                    sessionBytesRead += bytesFromNetwork;</span>
+                }
+<span class="fc" id="L215">            }</span>
+
+            // Phase 2: Attempt TLS decryption
+<span class="fc" id="L218">            networkInboundStore.flip();</span>
+            try {
+<span class="fc bfc" id="L220" title="All 2 branches covered.">                if (!networkInboundStore.hasRemaining()) {</span>
+<span class="fc" id="L221">                    return totalReadFromNetwork;</span>
+                }
+
+<span class="fc" id="L224">                totalReadFromNetwork += sessionBytesRead;</span>
+
+<span class="fc" id="L226">                SSLEngineResult result = engine.unwrap(networkInboundStore, decryptionScratchpad);</span>
+
+                // Phase 3: Interpret result
+<span class="pc bpc" id="L229" title="1 of 5 branches missed.">                switch (result.getStatus()) {</span>
+                    case OK:
+<span class="pc bpc" id="L231" title="1 of 5 branches missed.">                        switch (result.getHandshakeStatus()) {</span>
+                            case NEED_UNWRAP:
+                                continue;
+                            case NEED_WRAP:
+<span class="fc" id="L235">                                break outer;</span>
+                            case NEED_TASK:
+<span class="fc" id="L237">                                DelegatedTasks.run(engine, taskExecutor);</span>
+                                continue;
+                            case NOT_HANDSHAKING:
+                            case FINISHED:
+<span class="fc" id="L241">                                continue;</span>
+                        }
+<span class="nc" id="L243">                        break;</span>
+
+                    case BUFFER_OVERFLOW:
+                        // If the scratchpad's capacity accommodates a full application record
+                        // beyond the plaintext it already holds, the overflow only means that
+                        // plaintext has not been drained yet — stop so the caller can drain it.
+                        // Otherwise the engine expanded the session's application buffer size
+                        // and the scratchpad must grow, or the record can never be unwrapped.
+<span class="fc" id="L251">                        int applicationSize = engine.getSession().getApplicationBufferSize();</span>
+<span class="pc bpc" id="L252" title="1 of 2 branches missed.">                        if (applicationSize + decryptionScratchpad.position() &lt;= decryptionScratchpad.capacity()) {</span>
+                            break outer;
+                        }
+<span class="fc" id="L255">                        ByteBuffer enlargedScratchpad = ByteBuffer.allocate(applicationSize + decryptionScratchpad.position());</span>
+<span class="fc" id="L256">                        decryptionScratchpad.flip();</span>
+<span class="fc" id="L257">                        enlargedScratchpad.put(decryptionScratchpad);</span>
+<span class="fc" id="L258">                        decryptionScratchpad = enlargedScratchpad;</span>
+                        continue;
+
+                    case CLOSED:
+<span class="pc bpc" id="L262" title="1 of 2 branches missed.">                        if (totalReadFromNetwork == 0) {</span>
+<span class="nc" id="L263">                            return -1;</span>
+                        } else {
+<span class="fc" id="L265">                            return totalReadFromNetwork;</span>
+                        }
+
+                    case BUFFER_UNDERFLOW:
+                        // The engine expands the session's packet size upon seeing the header of
+                        // a record larger than the buffer this store was sized from (tolerated up
+                        // to twice the spec maximum, for interoperability with old buggy stacks).
+                        // The store must grow along with it: at its original capacity the record
+                        // could never fit, so every subsequent read would report underflow with
+                        // the record's tail still pending in the kernel — a level-triggered
+                        // selector would fire forever, spinning the CPU at 100% without progress.
+<span class="fc" id="L276">                        int packetSize = engine.getSession().getPacketBufferSize();</span>
+<span class="fc bfc" id="L277" title="All 2 branches covered.">                        if (packetSize &gt; networkInboundStore.capacity()) {</span>
+<span class="fc" id="L278">                            ByteBuffer enlargedStore = ByteBuffer.allocate(packetSize);</span>
+<span class="fc" id="L279">                            enlargedStore.put(networkInboundStore);</span>
+<span class="fc" id="L280">                            enlargedStore.flip();</span>
+<span class="fc" id="L281">                            networkInboundStore = enlargedStore;</span>
+                            continue;
+                        }
+                        // A partial TLS record remains in the inbound buffer and the engine needs
+                        // more bytes to decrypt it. If no new data arrived from the network this
+                        // iteration, re-looping cannot make progress and would spin the CPU at 100%.
+                        // This is remotely triggerable: a peer can send the first few bytes of a
+                        // record header, then go quiet, pinning a server thread indefinitely (DoS).
+                        // Return to the caller instead; decryption resumes once the selector signals
+                        // that more readable data has arrived.
+<span class="fc bfc" id="L291" title="All 2 branches covered.">                        if (sessionBytesRead == 0) {</span>
+<span class="fc" id="L292">                            return totalReadFromNetwork;</span>
+                        }
+                }
+            } finally {
+<span class="fc" id="L296">                networkInboundStore.compact();</span>
+            }
+<span class="pc bpc" id="L298" title="1 of 4 branches missed.">        } while (decryptionScratchpad.hasRemaining() &amp;&amp; ++loops &lt; MAX_ENGINE_LOOPS);</span>
+
+<span class="fc" id="L300">        return totalReadFromNetwork;</span>
+    }
+
+    private int performEncryption(ByteBuffer applicationOutboundRegion) throws IOException {
+<span class="fc" id="L304">        int totalWrittenToNetwork = 0;</span>
+
+        // Phase 1: Flush any previously encrypted but unsent data
+<span class="pc bpc" id="L307" title="1 of 2 branches missed.">        if (networkOutboundStore.hasRemaining()) {</span>
+<span class="nc" id="L308">            int flushed = transmitToNetwork(networkOutboundStore);</span>
+<span class="nc bnc" id="L309" title="All 2 branches missed.">            if (flushed &lt; 0) {</span>
+<span class="nc" id="L310">                return flushed;</span>
+            }
+<span class="nc" id="L312">            totalWrittenToNetwork += flushed;</span>
+        }
+
+        // Phase 2: Encrypt and transmit application data
+        encryptCycle:
+<span class="pc bpc" id="L317" title="1 of 2 branches missed.">        for (int loops = 0; loops &lt; MAX_ENGINE_LOOPS; loops++) {</span>
+<span class="fc" id="L318">            networkOutboundStore.compact();</span>
+
+<span class="fc" id="L320">            SSLEngineResult result = engine.wrap(applicationOutboundRegion, networkOutboundStore);</span>
+
+<span class="fc" id="L322">            networkOutboundStore.flip();</span>
+
+            // Phase 2a: Transmit any newly encrypted data
+<span class="fc bfc" id="L325" title="All 2 branches covered.">            if (networkOutboundStore.hasRemaining()) {</span>
+<span class="fc" id="L326">                int written = transmitToNetwork(networkOutboundStore);</span>
+<span class="pc bpc" id="L327" title="1 of 2 branches missed.">                if (written &lt; 0) {</span>
+<span class="nc bnc" id="L328" title="All 2 branches missed.">                    if (totalWrittenToNetwork == 0) {</span>
+<span class="nc" id="L329">                        return written;</span>
+                    } else {
+<span class="nc" id="L331">                        return totalWrittenToNetwork;</span>
+                    }
+                } else {
+<span class="fc" id="L334">                    totalWrittenToNetwork += written;</span>
+                }
+            }
+
+            // Phase 2b: Interpret result
+<span class="pc bpc" id="L339" title="3 of 4 branches missed.">            switch (result.getStatus()) {</span>
+                case OK:
+<span class="pc bpc" id="L341" title="2 of 5 branches missed.">                    switch (result.getHandshakeStatus()) {</span>
+                        case NEED_WRAP:
+<span class="fc" id="L343">                            continue;</span>
+                        case NEED_UNWRAP:
+<span class="fc" id="L345">                            break encryptCycle;</span>
+                        case NEED_TASK:
+<span class="nc" id="L347">                            DelegatedTasks.run(engine, taskExecutor);</span>
+<span class="nc" id="L348">                            continue;</span>
+                        case NOT_HANDSHAKING:
+                        case FINISHED:
+<span class="fc bfc" id="L351" title="All 2 branches covered.">                            if (applicationOutboundRegion.hasRemaining()) {</span>
+<span class="fc" id="L352">                                continue;</span>
+                            } else {
+                                break encryptCycle;
+                            }
+                    }
+<span class="nc" id="L357">                    break;</span>
+
+                case BUFFER_OVERFLOW:
+                    // If the store's capacity accommodates a full packet beyond the unsent bytes
+                    // it already holds, the overflow is due to that backlog — stop and wait for
+                    // the socket to drain. Otherwise the engine expanded the session's packet
+                    // size and the store must grow, or wrap could never make progress. (JSSE
+                    // never wraps beyond the spec maximum the store was sized for, so the growth
+                    // path is defensive.)
+<span class="nc" id="L366">                    int packetSize = engine.getSession().getPacketBufferSize();</span>
+<span class="nc bnc" id="L367" title="All 2 branches missed.">                    if (packetSize + networkOutboundStore.remaining() &lt;= networkOutboundStore.capacity()) {</span>
+<span class="nc" id="L368">                        break encryptCycle;</span>
+                    }
+<span class="nc" id="L370">                    ByteBuffer enlargedStore = ByteBuffer.allocate(packetSize + networkOutboundStore.remaining());</span>
+<span class="nc" id="L371">                    enlargedStore.put(networkOutboundStore);</span>
+<span class="nc" id="L372">                    enlargedStore.flip();</span>
+<span class="nc" id="L373">                    networkOutboundStore = enlargedStore;</span>
+<span class="nc" id="L374">                    continue;</span>
+
+                case BUFFER_UNDERFLOW, CLOSED:
+<span class="nc" id="L377">                    break encryptCycle;</span>
+            }
+        }
+
+<span class="fc" id="L381">        return totalWrittenToNetwork;</span>
+    }
+
+    private int transmitToNetwork(ByteBuffer sourceRegion) throws IOException {
+<span class="fc" id="L385">        int totalWritten = 0;</span>
+<span class="fc bfc" id="L386" title="All 2 branches covered.">        while (sourceRegion.hasRemaining()) {</span>
+<span class="fc" id="L387">            int written = rawChannel.write(sourceRegion);</span>
+<span class="pc bpc" id="L388" title="1 of 2 branches missed.">            if (written == 0) {</span>
+<span class="nc" id="L389">                break;</span>
+<span class="pc bpc" id="L390" title="1 of 2 branches missed.">            } else if (written &lt; 0) {</span>
+<span class="nc bnc" id="L391" title="All 2 branches missed.">                if (totalWritten == 0) {</span>
+<span class="nc" id="L392">                    return written;</span>
+                } else {
+<span class="nc" id="L394">                    return totalWritten;</span>
+                }
+            }
+<span class="fc" id="L397">            totalWritten += written;</span>
+<span class="fc" id="L398">        }</span>
+<span class="fc" id="L399">        return totalWritten;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.15.202606040825</span></div></body></html>

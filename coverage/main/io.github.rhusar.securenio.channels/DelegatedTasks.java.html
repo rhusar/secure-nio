@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DelegatedTasks.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">Secure NIO</a> &gt; <a href="index.source.html" class="el_package">io.github.rhusar.securenio.channels</a> &gt; <span class="el_source">DelegatedTasks.java</span></div><h1>DelegatedTasks.java</h1><pre class="source lang-java linenums">/*
+ * Copyright Radoslav Husar and contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package io.github.rhusar.securenio.channels;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+
+import javax.net.ssl.SSLEngine;
+
+/**
+ * Runs an {@link SSLEngine}'s delegated (potentially long-running) handshake tasks to completion.
+ *
+ * @author Radoslav Husar
+ */
+final class DelegatedTasks {
+
+    /**
+     * Runs the engine's delegated handshake tasks to completion.
+     * &lt;p&gt;
+     * Tasks are offloaded to the task executor and this method blocks until they finish. It must
+     * not return while a task is still pending: until every task completes the engine's handshake
+     * status stays {@code NEED_TASK}, so the wrap/unwrap loop that called this would make no progress
+     * and spin the CPU at 100%. If the executor cannot accept a task (for example it has been shut
+     * down, which otherwise surfaces as an unchecked {@link RejectedExecutionException} escaping a
+     * read or write), the task is run inline so the handshake can still complete.
+     */
+    static void run(SSLEngine engine, ExecutorService taskExecutor) throws IOException {
+        Runnable task;
+<span class="fc" id="L36">        List&lt;Future&lt;?&gt;&gt; pending = null;</span>
+<span class="fc bfc" id="L37" title="All 2 branches covered.">        while ((task = engine.getDelegatedTask()) != null) {</span>
+            try {
+<span class="fc" id="L39">                Future&lt;?&gt; future = taskExecutor.submit(task);</span>
+<span class="pc bpc" id="L40" title="1 of 2 branches missed.">                if (pending == null) {</span>
+<span class="fc" id="L41">                    pending = new ArrayList&lt;&gt;();</span>
+                }
+<span class="fc" id="L43">                pending.add(future);</span>
+<span class="nc" id="L44">            } catch (RejectedExecutionException rejected) {</span>
+                // Executor unavailable (e.g. shut down): run the task inline rather than letting the
+                // rejection escape or leaving the handshake permanently stuck on NEED_TASK.
+<span class="nc" id="L47">                task.run();</span>
+<span class="pc" id="L48">            }</span>
+        }
+
+<span class="pc bpc" id="L51" title="1 of 2 branches missed.">        if (pending == null) {</span>
+<span class="nc" id="L52">            return;</span>
+        }
+
+<span class="fc bfc" id="L55" title="All 2 branches covered.">        for (Future&lt;?&gt; future : pending) {</span>
+            try {
+<span class="fc" id="L57">                future.get();</span>
+<span class="nc" id="L58">            } catch (InterruptedException interrupted) {</span>
+<span class="nc" id="L59">                Thread.currentThread().interrupt();</span>
+<span class="nc" id="L60">                throw new IOException(&quot;Interrupted while awaiting TLS handshake task completion&quot;, interrupted);</span>
+<span class="nc" id="L61">            } catch (ExecutionException failed) {</span>
+<span class="nc" id="L62">                throw new IOException(&quot;TLS handshake task failed&quot;, failed.getCause());</span>
+<span class="fc" id="L63">            }</span>
+<span class="fc" id="L64">        }</span>
+<span class="fc" id="L65">    }</span>
+
+    private DelegatedTasks() {
+        // Static utility.
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.15.202606040825</span></div></body></html>
