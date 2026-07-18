@@ -171,7 +171,9 @@ final class TLSByteChannel {
     }
 
     /**
-     * Shuts down the TLS engine, suppressing any faults.
+     * Shuts down the TLS engine. Faults are suppressed by design: {@code closeInbound()} throws an
+     * {@code SSLException} whenever the peer's {@code close_notify} has not arrived, which is
+     * routine on a locally initiated close and not actionable once the raw socket is gone.
      */
     void shutdown() {
         try {

@@ -22,6 +22,8 @@ import java.util.concurrent.TimeUnit;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLEngineResult;
+import javax.net.ssl.SSLException;
 
 import org.junit.After;
 import org.junit.Before;
@@ -145,6 +147,39 @@ public class SecureSocketChannelTestCase {
     public void closeClosesDelegate() throws Exception {
         secureChannel.close();
         assertFalse(rawChannel.isOpen());
+    }
+
+    /**
+     * A {@code close_notify} that cannot be produced or transmitted must be reported to the caller
+     * rather than swallowed, but only after the raw socket has been closed so the failure does not
+     * leak it.
+     */
+    @Test
+    public void closeReportsCloseNotifyFailureAfterClosingDelegate() throws Exception {
+        SocketChannel raw = SocketChannel.open();
+        ExecutorService taskExecutor = Executors.newSingleThreadExecutor();
+        try {
+            SSLException wrapFailure = new SSLException("close_notify wrap failed");
+            SSLEngine engine = new ZeroPlaintextSSLEngine(SSLContext.getDefault().createSSLEngine().getSession()) {
+                @Override
+                public SSLEngineResult wrap(ByteBuffer[] srcs, int offset, int length, ByteBuffer dst) throws SSLException {
+                    throw wrapFailure;
+                }
+
+                @Override
+                public boolean isOutboundDone() {
+                    return false;
+                }
+            };
+            SecureSocketChannel channel = new SecureSocketChannel(raw, engine, taskExecutor);
+
+            SSLException thrown = assertThrows(SSLException.class, channel::close);
+            assertSame(wrapFailure, thrown);
+            assertFalse("raw channel leaked by failed close", raw.isOpen());
+        } finally {
+            taskExecutor.shutdownNow();
+            raw.close();
+        }
     }
 
     /**

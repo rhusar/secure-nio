@@ -25,6 +25,8 @@ import java.util.concurrent.TimeUnit;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
+import javax.net.ssl.SSLEngineResult;
+import javax.net.ssl.SSLException;
 
 import org.junit.After;
 import org.junit.Before;
@@ -104,6 +106,36 @@ public class SecureDatagramChannelTestCase {
     public void closeClosesDelegate() throws Exception {
         secureChannel.close();
         assertFalse(rawChannel.isOpen());
+    }
+
+    /**
+     * A {@code close_notify} that cannot be produced or transmitted must be reported to the caller
+     * rather than swallowed, but only after the raw socket has been closed so the failure does not
+     * leak it.
+     */
+    @Test
+    public void closeReportsCloseNotifyFailureAfterClosingDelegate() throws Exception {
+        DatagramChannel raw = DatagramChannel.open();
+        ExecutorService taskExecutor = Executors.newSingleThreadExecutor();
+        try {
+            SSLContext sslContext = SSLContext.getInstance("DTLS");
+            sslContext.init(null, null, null);
+            SSLException wrapFailure = new SSLException("close_notify wrap failed");
+            SSLEngine engine = new ZeroPlaintextSSLEngine(sslContext.createSSLEngine().getSession()) {
+                @Override
+                public SSLEngineResult wrap(ByteBuffer[] srcs, int offset, int length, ByteBuffer dst) throws SSLException {
+                    throw wrapFailure;
+                }
+            };
+            SecureDatagramChannel channel = new SecureDatagramChannel(raw, engine, taskExecutor);
+
+            SSLException thrown = assertThrows(SSLException.class, channel::close);
+            assertSame(wrapFailure, thrown);
+            assertFalse("raw channel leaked by failed close", raw.isOpen());
+        } finally {
+            taskExecutor.shutdownNow();
+            raw.close();
+        }
     }
 
     @Test(expected = NotYetConnectedException.class)

@@ -8,6 +8,7 @@ import java.nio.ByteBuffer;
 
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLEngineResult;
+import javax.net.ssl.SSLException;
 import javax.net.ssl.SSLSession;
 
 /**
@@ -39,7 +40,7 @@ class ZeroPlaintextSSLEngine extends SSLEngine {
     }
 
     @Override
-    public SSLEngineResult wrap(ByteBuffer[] srcs, int offset, int length, ByteBuffer dst) {
+    public SSLEngineResult wrap(ByteBuffer[] srcs, int offset, int length, ByteBuffer dst) throws SSLException {
         return new SSLEngineResult(SSLEngineResult.Status.OK, SSLEngineResult.HandshakeStatus.NOT_HANDSHAKING, 0, 0);
     }
 

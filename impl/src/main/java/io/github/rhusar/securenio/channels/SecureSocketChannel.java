@@ -198,14 +198,24 @@ public class SecureSocketChannel extends SocketChannel {
             return;
         }
         try {
+            IOException closeNotifyFailure = null;
             try {
                 // Announce closure with a close_notify alert while the raw socket is still open, so a
-                // compliant peer does not mistake our shutdown for a truncation attack.
-                tlsChannel.closeOutbound();
-            } catch (Exception ignored) {
+                // compliant peer does not mistake our shutdown for a truncation attack. If the raw
+                // socket is already closed the alert is impossible and there is nothing to report.
+                if (delegate.isOpen()) {
+                    tlsChannel.closeOutbound();
+                }
+            } catch (IOException e) {
+                // Deferred, not swallowed: the raw socket must be closed and the engine shut down
+                // regardless, and only then can the failed close_notify be reported to the caller.
+                closeNotifyFailure = e;
             } finally {
                 delegate.close();
                 tlsChannel.shutdown();
+            }
+            if (closeNotifyFailure != null) {
+                throw closeNotifyFailure;
             }
         } finally {
             lock.unlock();

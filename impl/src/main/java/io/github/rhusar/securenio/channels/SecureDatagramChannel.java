@@ -300,14 +300,24 @@ public class SecureDatagramChannel extends DatagramChannel {
             return;
         }
         try {
+            IOException closeNotifyFailure = null;
             try {
                 // Announce closure with a best-effort close_notify alert while the raw socket is still
-                // open; the single datagram may be lost, which DTLS peers must tolerate.
-                dtlsChannel.closeOutbound();
-            } catch (Exception ignored) {
+                // open; the single datagram may be lost, which DTLS peers must tolerate. If the raw
+                // socket is already closed the alert is impossible and there is nothing to report.
+                if (delegate.isOpen()) {
+                    dtlsChannel.closeOutbound();
+                }
+            } catch (IOException e) {
+                // Deferred, not swallowed: the raw socket must be closed and the engine shut down
+                // regardless, and only then can the failed close_notify be reported to the caller.
+                closeNotifyFailure = e;
             } finally {
                 delegate.close();
                 dtlsChannel.shutdown();
+            }
+            if (closeNotifyFailure != null) {
+                throw closeNotifyFailure;
             }
         } finally {
             lock.unlock();
