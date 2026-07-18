@@ -164,6 +164,10 @@ mvn clean verify -Djacoco.skip=true
 Coverage reports for `main` are published alongside the Javadoc at
 [rhusar.github.io/secure-nio/coverage/main](https://rhusar.github.io/secure-nio/coverage/main/).
 
+## Contributing
+
+Contributions are welcome – see [CONTRIBUTING.md](CONTRIBUTING.md) for build, style, and sign-off requirements.
+
 ## Reporting Issues
 
 Please report bugs and feature requests via [GitHub Issues](https://github.com/rhusar/secure-nio/issues).
