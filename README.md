@@ -19,6 +19,18 @@ The library has no runtime dependencies.
 | `SecureDatagramChannel` | A `DatagramChannel` decorator that transparently encrypts and decrypts datagrams with DTLS. Operates in connected mode only – one DTLS session per peer pair. |
 | `DelegatingSelectorProvider` | A `SelectorProvider` that opens `Selector`s capable of registering the TLS/DTLS-wrapped channels above, transparently unwrapping them to the raw channel on registration. |
 
+## Installation
+
+Add the dependency to your `pom.xml`:
+
+```xml
+<dependency>
+    <groupId>io.github.rhusar.securenio</groupId>
+    <artifactId>secure-nio</artifactId>
+    <version>1.0.0-SNAPSHOT</version>
+</dependency>
+```
+
 ## Usage
 
 ### Server side
