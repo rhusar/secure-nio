@@ -11,6 +11,7 @@ import java.net.SocketOption;
 import java.nio.ByteBuffer;
 import java.nio.channels.IllegalBlockingModeException;
 import java.nio.channels.SocketChannel;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -90,6 +91,10 @@ public class SecureSocketChannel extends SocketChannel {
      */
     @Override
     public int read(ByteBuffer dst) throws IOException {
+        Objects.requireNonNull(dst);
+        if (dst.isReadOnly()) {
+            throw new IllegalArgumentException("Read-only buffer");
+        }
         requireNonBlocking();
         lock.lock();
         try {
@@ -106,6 +111,7 @@ public class SecureSocketChannel extends SocketChannel {
 
     @Override
     public long read(ByteBuffer[] dsts, int offset, int length) throws IOException {
+        Objects.checkFromIndexSize(offset, length, dsts.length);
         long totalRead = 0;
         for (int i = offset; i < offset + length; i++) {
             ByteBuffer region = dsts[i];
@@ -135,6 +141,7 @@ public class SecureSocketChannel extends SocketChannel {
      */
     @Override
     public int write(ByteBuffer src) throws IOException {
+        Objects.requireNonNull(src);
         requireNonBlocking();
         lock.lock();
         try {
@@ -151,6 +158,7 @@ public class SecureSocketChannel extends SocketChannel {
 
     @Override
     public long write(ByteBuffer[] srcs, int offset, int length) throws IOException {
+        Objects.checkFromIndexSize(offset, length, srcs.length);
         long totalWritten = 0;
         for (int i = offset; i < offset + length; i++) {
             ByteBuffer region = srcs[i];

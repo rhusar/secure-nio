@@ -139,6 +139,10 @@ public class SecureDatagramChannel extends DatagramChannel {
      */
     @Override
     public int read(ByteBuffer dst) throws IOException {
+        Objects.requireNonNull(dst);
+        if (dst.isReadOnly()) {
+            throw new IllegalArgumentException("Read-only buffer");
+        }
         checkConnected();
         requireNonBlocking();
         lock.lock();
@@ -151,6 +155,7 @@ public class SecureDatagramChannel extends DatagramChannel {
 
     @Override
     public long read(ByteBuffer[] dsts, int offset, int length) throws IOException {
+        Objects.checkFromIndexSize(offset, length, dsts.length);
         // A single datagram's plaintext is delivered into the first buffer with room; datagram
         // semantics discard what does not fit, so spreading across buffers is not attempted.
         for (int i = offset; i < offset + length; i++) {
@@ -169,6 +174,7 @@ public class SecureDatagramChannel extends DatagramChannel {
      */
     @Override
     public int write(ByteBuffer src) throws IOException {
+        Objects.requireNonNull(src);
         checkConnected();
         requireNonBlocking();
         lock.lock();
@@ -181,6 +187,7 @@ public class SecureDatagramChannel extends DatagramChannel {
 
     @Override
     public long write(ByteBuffer[] srcs, int offset, int length) throws IOException {
+        Objects.checkFromIndexSize(offset, length, srcs.length);
         long totalWritten = 0;
         for (int i = offset; i < offset + length; i++) {
             ByteBuffer region = srcs[i];
@@ -201,6 +208,11 @@ public class SecureDatagramChannel extends DatagramChannel {
 
     @Override
     public SocketAddress receive(ByteBuffer dst) throws IOException {
+        // Validated here as well as in read(ByteBuffer) so that a read-only destination is rejected
+        // before the connected-state check, matching the order the DatagramChannel contract implies.
+        if (dst.isReadOnly()) {
+            throw new IllegalArgumentException("Read-only buffer");
+        }
         checkConnected();
         return this.read(dst) > 0 ? delegate.getRemoteAddress() : null;
     }
@@ -215,6 +227,7 @@ public class SecureDatagramChannel extends DatagramChannel {
      */
     @Override
     public int send(ByteBuffer src, SocketAddress target) throws IOException {
+        Objects.requireNonNull(src);
         checkConnected();
         if (!Objects.equals(target, delegate.getRemoteAddress())) {
             throw new AlreadyConnectedException();

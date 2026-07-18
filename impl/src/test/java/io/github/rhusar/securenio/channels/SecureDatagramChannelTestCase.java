@@ -127,6 +127,42 @@ public class SecureDatagramChannelTestCase {
     }
 
     @Test
+    public void receiveRejectsReadOnlyBufferBeforeCheckingConnected() {
+        // The read-only buffer is an argument error and must be reported ahead of the connected-state
+        // check, as the DatagramChannel contract does.
+        assertThrows(IllegalArgumentException.class, () -> secureChannel.receive(ByteBuffer.allocate(16).asReadOnlyBuffer()));
+    }
+
+    @Test
+    public void readRejectsReadOnlyBuffer() {
+        assertThrows(IllegalArgumentException.class, () -> secureChannel.read(ByteBuffer.allocate(16).asReadOnlyBuffer()));
+        assertThrows(IllegalArgumentException.class, () -> secureChannel.read(new ByteBuffer[]{ ByteBuffer.allocate(16).asReadOnlyBuffer() }, 0, 1));
+    }
+
+    @Test
+    public void writeAcceptsReadOnlyBuffer() {
+        // A read-only source is legal input to write; only the destination of a read must be writable.
+        assertThrows(NotYetConnectedException.class, () -> secureChannel.write(ByteBuffer.wrap("data".getBytes()).asReadOnlyBuffer()));
+    }
+
+    @Test
+    public void scatteringIoRejectsOutOfBoundsRange() {
+        ByteBuffer[] buffers = new ByteBuffer[]{ ByteBuffer.allocate(16), ByteBuffer.allocate(16) };
+
+        assertThrows(IndexOutOfBoundsException.class, () -> secureChannel.read(buffers, -1, 1));
+        assertThrows(IndexOutOfBoundsException.class, () -> secureChannel.read(buffers, 0, 5));
+        assertThrows(IndexOutOfBoundsException.class, () -> secureChannel.write(buffers, -1, 1));
+        assertThrows(IndexOutOfBoundsException.class, () -> secureChannel.write(buffers, 0, 5));
+    }
+
+    @Test
+    public void ioRejectsNullBuffer() {
+        assertThrows(NullPointerException.class, () -> secureChannel.read((ByteBuffer) null));
+        assertThrows(NullPointerException.class, () -> secureChannel.write((ByteBuffer) null));
+        assertThrows(NullPointerException.class, () -> secureChannel.send(null, new InetSocketAddress(InetAddress.getLoopbackAddress(), 12345)));
+    }
+
+    @Test
     public void sendToForeignAddressThrows() throws Exception {
         try (DatagramChannel peer = DatagramChannel.open()) {
             peer.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));

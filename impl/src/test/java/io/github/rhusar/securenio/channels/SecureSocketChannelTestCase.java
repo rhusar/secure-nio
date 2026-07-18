@@ -114,6 +114,34 @@ public class SecureSocketChannelTestCase {
     }
 
     @Test
+    public void readRejectsReadOnlyBuffer() {
+        assertThrows(IllegalArgumentException.class, () -> secureChannel.read(ByteBuffer.allocate(16).asReadOnlyBuffer()));
+        assertThrows(IllegalArgumentException.class, () -> secureChannel.read(new ByteBuffer[]{ ByteBuffer.allocate(16).asReadOnlyBuffer() }, 0, 1));
+    }
+
+    @Test
+    public void writeAcceptsReadOnlyBuffer() {
+        // A read-only source is legal input to write; only the destination of a read must be writable.
+        assertThrows(IllegalBlockingModeException.class, () -> secureChannel.write(ByteBuffer.allocate(16).asReadOnlyBuffer()));
+    }
+
+    @Test
+    public void scatteringIoRejectsOutOfBoundsRange() {
+        ByteBuffer[] buffers = new ByteBuffer[]{ ByteBuffer.allocate(16), ByteBuffer.allocate(16) };
+
+        assertThrows(IndexOutOfBoundsException.class, () -> secureChannel.read(buffers, -1, 1));
+        assertThrows(IndexOutOfBoundsException.class, () -> secureChannel.read(buffers, 0, 5));
+        assertThrows(IndexOutOfBoundsException.class, () -> secureChannel.write(buffers, -1, 1));
+        assertThrows(IndexOutOfBoundsException.class, () -> secureChannel.write(buffers, 0, 5));
+    }
+
+    @Test
+    public void ioRejectsNullBuffer() {
+        assertThrows(NullPointerException.class, () -> secureChannel.read((ByteBuffer) null));
+        assertThrows(NullPointerException.class, () -> secureChannel.write((ByteBuffer) null));
+    }
+
+    @Test
     public void closeClosesDelegate() throws Exception {
         secureChannel.close();
         assertFalse(rawChannel.isOpen());
