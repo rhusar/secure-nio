@@ -394,6 +394,77 @@ public class TLSLoopbackTestCase {
     }
 
     /**
+     * The engine tolerates records up to twice the spec maximum (~33KB) for interoperability with
+     * old buggy TLS stacks, expanding the session's buffer sizes when such a record's header
+     * arrives. The channel's internal buffers, sized from the initial session, must be re-grown
+     * accordingly. Before the fix they never were: the inbound store filled to its original
+     * capacity, every unwrap reported {@code BUFFER_UNDERFLOW}, and each {@code read()} returned 0
+     * with the record's tail still pending in the kernel — so a level-triggered selector fires
+     * forever without progress, spinning the CPU at 100% (remotely triggerable DoS). With
+     * re-growth the record is fully ingested and this garbage one is then rejected by the engine,
+     * surfacing an {@link SSLException}.
+     */
+    @Test
+    public void oversizedRecordRegrowsInboundBufferInsteadOfStalling() throws Exception {
+        DelegatingSelectorProvider selectorProvider = new DelegatingSelectorProvider();
+
+        try (ServerSocketChannel rawServerChannel = ServerSocketChannel.open();
+             Selector acceptSelector = selectorProvider.openSelector();
+             SocketChannel rawClientChannel = SocketChannel.open()) {
+
+            SecureServerSocketChannel secureServerChannel = new SecureServerSocketChannel(rawServerChannel, sslContext, taskExecutor);
+            secureServerChannel.configureBlocking(false);
+            secureServerChannel.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
+
+            InetSocketAddress serverAddress = (InetSocketAddress) secureServerChannel.getLocalAddress();
+            secureServerChannel.register(acceptSelector, SelectionKey.OP_ACCEPT);
+
+            // A raw (non-TLS) client stands in for the misbehaving peer.
+            rawClientChannel.connect(serverAddress);
+
+            acceptSelector.select(HANDSHAKE_TIMEOUT_MS);
+            acceptSelector.selectedKeys().clear();
+            SocketChannel serverChannel = secureServerChannel.accept();
+            assertTrue(serverChannel instanceof SecureSocketChannel);
+            serverChannel.configureBlocking(false);
+
+            // Craft a handshake record whose claimed length exceeds the packet buffer size of the
+            // initial session (~16.7KB) but stays within the engine's large-record tolerance
+            // (~33KB), followed by a garbage body of that length.
+            int claimedLength = 20_000;
+            ByteBuffer oversizedRecord = ByteBuffer.allocate(5 + claimedLength);
+            oversizedRecord.put((byte) 0x16).put((byte) 0x03).put((byte) 0x01);
+            oversizedRecord.putShort((short) claimedLength);
+            while (oversizedRecord.hasRemaining()) {
+                oversizedRecord.put((byte) 0xFF);
+            }
+            oversizedRecord.flip();
+            while (oversizedRecord.hasRemaining()) {
+                rawClientChannel.write(oversizedRecord);
+            }
+
+            // The server must ingest the whole record — growing its inbound buffer along with the
+            // expanded session size — and then reject the garbage. Before the fix, read() consumed
+            // the head of the record and returned 0 forever, never able to fit the rest.
+            ByteBuffer dst = ByteBuffer.allocate(1024);
+            long deadline = System.currentTimeMillis() + HANDSHAKE_TIMEOUT_MS;
+            try {
+                while (System.currentTimeMillis() < deadline) {
+                    int read = serverChannel.read(dst);
+                    assertEquals("no plaintext can be produced from a garbage record", 0, read);
+                    Thread.yield();
+                }
+                fail("read() never ingested the oversized record — the inbound buffer was not re-grown");
+            } catch (SSLException expected) {
+                // The record was fully ingested and rejected — no stall.
+            }
+
+            serverChannel.close();
+            secureServerChannel.close();
+        }
+    }
+
+    /**
      * A graceful {@link SecureSocketChannel#close()} must transmit a TLS {@code close_notify} alert
      * before tearing down the raw socket. The peer must then observe a clean end-of-stream ({@code -1})
      * rather than a truncation {@link SSLException} — otherwise our own orderly close is indistinguishable
