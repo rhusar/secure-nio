@@ -113,6 +113,11 @@ public class SecureDatagramChannel extends DatagramChannel {
 
     /**
      * {@inheritDoc}
+     * <p>
+     * At most one DTLS application record (one message) is delivered per call, preserving message
+     * boundaries. A peer may coalesce several records into a single datagram; the surplus is
+     * buffered and returned by subsequent reads without touching the network, so after the
+     * selector signals readability callers should keep reading until this method returns 0.
      *
      * @throws IllegalBlockingModeException if this channel is in blocking mode; only non-blocking
      *                                      mode is supported (see the class documentation)

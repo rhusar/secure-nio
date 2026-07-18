@@ -18,12 +18,14 @@ import javax.net.ssl.SSLSession;
  * payload encryption, payload decryption, and delegated computational tasks.
  * <p>
  * This class wraps a raw connected {@link DatagramChannel} and a DTLS-mode {@link SSLEngine}.
- * Unlike its stream sibling {@link TLSByteChannel}, it preserves datagram boundaries: each
- * {@code wrap} produces exactly one datagram that is transmitted whole, and each {@code decrypt}
- * consumes at most one received datagram. There is no partial-record accumulation (UDP delivers
- * whole datagrams or nothing), no end-of-stream or truncation handling (UDP has no EOF), and
- * decrypted plaintext exceeding the caller's buffer is discarded per standard datagram
- * truncation semantics rather than carried over.
+ * Unlike its stream sibling {@link TLSByteChannel}, it preserves datagram and record boundaries:
+ * each {@code wrap} produces exactly one datagram that is transmitted whole, and each
+ * {@code decrypt} delivers at most one application record. When a peer coalesces several
+ * application records into a single datagram, the surplus records are retained and delivered one
+ * per subsequent {@code decrypt} call rather than concatenated into one read. There is no
+ * partial-record accumulation (UDP delivers whole datagrams or nothing), no end-of-stream or
+ * truncation handling (UDP has no EOF), and plaintext of a single record exceeding the caller's
+ * buffer is discarded per standard datagram truncation semantics rather than carried over.
  * <p>
  * The DTLS engine has no retransmission timer of its own: when a handshake flight is lost, the
  * caller must invoke {@link #retransmit()} after a timeout to make the engine reproduce it.
@@ -48,7 +50,10 @@ final class DTLSByteChannel {
 
     // Buffers are sized from the initial session and re-grown on BUFFER_OVERFLOW: the negotiated
     // session's buffer sizes can exceed the pre-handshake session's.
-    /** Holds at most one received datagram at a time. */
+    /**
+     * Holds at most one received datagram at a time. Records not yet unwrapped — the surplus of a
+     * coalesced datagram — remain between its position and limit across {@code decrypt} calls.
+     */
     private final ByteBuffer networkInboundStore;
     /** Holds at most one wrapped datagram awaiting transmission; never accumulates a second. */
     private ByteBuffer networkOutboundStore;
@@ -62,6 +67,7 @@ final class DTLSByteChannel {
         SSLSession session = engine.getSession();
 
         this.networkInboundStore = ByteBuffer.allocate(session.getPacketBufferSize());
+        this.networkInboundStore.flip();
         this.networkOutboundStore = ByteBuffer.allocate(session.getPacketBufferSize());
         this.networkOutboundStore.flip();
 
@@ -71,6 +77,10 @@ final class DTLSByteChannel {
     /**
      * Receives and decrypts at most one datagram, depositing plaintext into the application region.
      * Handshake flights are processed transparently, including emitting responding flights.
+     * <p>
+     * At most one application record is delivered per call. When the datagram coalesces several
+     * application records, the surplus is retained and delivered by subsequent calls — which drain
+     * it before touching the network — so callers should keep reading until 0 is returned.
      *
      * @return plaintext bytes delivered, 0 if no datagram arrived or it carried only handshake
      *         records, or -1 if the peer has closed the session with a {@code close_notify} alert
@@ -80,15 +90,19 @@ final class DTLSByteChannel {
             return -1;
         }
 
-        networkInboundStore.clear();
-        int received = rawChannel.read(networkInboundStore);
-        networkInboundStore.flip();
+        // Records retained from a previously received coalesced datagram are drained first; a new
+        // datagram is received only once the store is empty.
+        if (!networkInboundStore.hasRemaining()) {
+            networkInboundStore.clear();
+            int received = rawChannel.read(networkInboundStore);
+            networkInboundStore.flip();
 
-        // Nothing arrived (non-blocking read; UDP has no end-of-stream, so a negative return is
-        // treated the same). Still enter the unwrap loop when the engine holds internally buffered
-        // reordered records (NEED_UNWRAP_AGAIN) — those must be processed without new network data.
-        if (received <= 0 && engine.getHandshakeStatus() != SSLEngineResult.HandshakeStatus.NEED_UNWRAP_AGAIN) {
-            return 0;
+            // Nothing arrived (non-blocking read; UDP has no end-of-stream, so a negative return is
+            // treated the same). Still enter the unwrap loop when the engine holds internally buffered
+            // reordered records (NEED_UNWRAP_AGAIN) — those must be processed without new network data.
+            if (received <= 0 && engine.getHandshakeStatus() != SSLEngineResult.HandshakeStatus.NEED_UNWRAP_AGAIN) {
+                return 0;
+            }
         }
 
         boolean closed = false;
@@ -119,7 +133,12 @@ final class DTLSByteChannel {
                             continue;
                         default:
                             // NEED_UNWRAP, NEED_UNWRAP_AGAIN, FINISHED, NOT_HANDSHAKING: a datagram
-                            // may carry a coalesced multi-record flight — keep draining.
+                            // may carry a coalesced multi-record flight — keep draining. An
+                            // application record instead ends the loop: it is delivered on its own,
+                            // and any records after it stay in the store for the next call.
+                            if (result.bytesProduced() > 0) {
+                                break unwrapLoop;
+                            }
                             continue;
                     }
 
