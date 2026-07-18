@@ -6,8 +6,10 @@ package io.github.rhusar.securenio.channels;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
+import java.io.EOFException;
 import java.io.InputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -534,6 +536,11 @@ public class DTLSLoopbackTestCase {
                 }
             }
             assertTrue("server never observed the peer's close_notify", sawClose);
+
+            // receive() has no return value that can express the ended session – null means "no
+            // datagram" – so it must report the peer close by throwing rather than masking it.
+            readBuf.clear();
+            assertThrows(EOFException.class, () -> serverChannel.receive(readBuf));
         } finally {
             clientChannel.close();
             serverChannel.close();

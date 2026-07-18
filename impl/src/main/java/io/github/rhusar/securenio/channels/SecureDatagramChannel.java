@@ -4,6 +4,7 @@
  */
 package io.github.rhusar.securenio.channels;
 
+import java.io.EOFException;
 import java.io.IOException;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
@@ -206,6 +207,17 @@ public class SecureDatagramChannel extends DatagramChannel {
         return totalWritten;
     }
 
+    /**
+     * {@inheritDoc}
+     * <p>
+     * The {@code receive()} contract has no return value that can express end-of-stream, so a peer
+     * close is reported by throwing: once the peer has ended the DTLS session with a
+     * {@code close_notify} alert – the condition {@link #read(ByteBuffer)} reports as {@code -1} –
+     * this method throws {@link EOFException} instead of returning {@code null}, which would be
+     * indistinguishable from no datagram having arrived.
+     *
+     * @throws EOFException if the peer has closed the DTLS session with a {@code close_notify} alert
+     */
     @Override
     public SocketAddress receive(ByteBuffer dst) throws IOException {
         // Validated here as well as in read(ByteBuffer) so that a read-only destination is rejected
@@ -214,7 +226,11 @@ public class SecureDatagramChannel extends DatagramChannel {
             throw new IllegalArgumentException("Read-only buffer");
         }
         checkConnected();
-        return this.read(dst) > 0 ? delegate.getRemoteAddress() : null;
+        int read = this.read(dst);
+        if (read < 0) {
+            throw new EOFException("DTLS session closed by peer");
+        }
+        return read > 0 ? delegate.getRemoteAddress() : null;
     }
 
     /**
